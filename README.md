@@ -9,7 +9,7 @@ Requires Python $\ge 3.10$ and `uv`.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-No manual `pip install` required. Script uses PEP 723 inline script metadata (`# /// script ... ///`). `uv run` resolves and caches dependencies automatically (`polars`, `duckdb`, `pyarrow`, `orjson`, `opencv-python-headless`, `rich`, `ultralytics`, `scenedetect`).
+No manual `pip install` required. Script uses PEP 723 inline script metadata (`# /// script ... ///`). `uv run` resolves and caches dependencies automatically (`polars`, `duckdb`, `pyarrow`, `orjson`, `opencv-python-headless`, `ultralytics`, `scenedetect`).
 
 ---
 
@@ -45,7 +45,6 @@ uv run AIC_indexer.py -r /path/to/videos -o /kaggle/working/obj-idx.parquet --st
 | `--conf` | Option (`float`) | `0.25` | Object detection confidence threshold. |
 | `--batch-size` | Option (`int`) | `32` | Frame inference batch size per GPU. |
 | `--num-gpus` | Option (`int`) | `0` | Number of GPUs to use. `0` auto-detects all GPUs (e.g. 2 workers for Kaggle 2x T4). |
-| `--log-mode` | Option (`str`) | `auto` | Log output style: `auto` (auto-detects Kaggle/headless), `line` (clean single-line per video), or `rich` (interactive terminal bar). |
 
 ### Argument Resolution Rules:
 - **`AIC_indexer.py -r folder1 folder2`**: `-r` collects `['folder1', 'folder2']`, scans recursively for video extensions.

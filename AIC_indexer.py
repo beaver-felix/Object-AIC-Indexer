@@ -6,7 +6,6 @@
 #     "pyarrow",
 #     "orjson",
 #     "opencv-python-headless",
-#     "rich",
 #     "ultralytics",
 #     "scenedetect",
 # ]
@@ -34,29 +33,7 @@ from typing import Any
 import cv2
 import numpy as np
 import polars as pl
-from rich import box
-from rich.console import Console
-from rich.markup import escape
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.table import Table
 
-
-def is_kaggle_or_headless() -> bool:
-    """Detect if running in Kaggle, Colab, CI, or headless/non-interactive terminal."""
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"):
-        return True
-    if os.environ.get("COLAB_RELEASE_TAG"):
-        return True
-    if not sys.stdout.isatty():
-        return True
-    return False
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm",
@@ -460,12 +437,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25).")
     parser.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
     parser.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs to use (0 = auto-detect all available GPUs e.g. 2 on Kaggle).")
-    parser.add_argument(
-        "--log-mode",
-        choices=["auto", "line", "rich"],
-        default="auto",
-        help="Logging mode: 'auto' (detects Kaggle/headless), 'line' (clean per-video lines), or 'rich' (animated bar).",
-    )
     return parser.parse_args()
 
 
@@ -501,11 +472,10 @@ def collect_video_files(inputs: list[str], recursive_arg: list[str] | None) -> l
 
 def main() -> None:
     args = parse_arguments()
-    console = Console()
 
     video_files = collect_video_files(args.inputs, args.recursive)
     if not video_files:
-        console.print("[bold red]No valid video files found to index.[/bold red]")
+        print("No valid video files found to index.", file=sys.stderr)
         sys.exit(1)
 
     output_path = Path(args.output).resolve()
@@ -519,19 +489,15 @@ def main() -> None:
     devices = [f"cuda:{i}" for i in range(num_workers)] if available_gpus > 0 else ["cpu"] * num_workers
 
     mode_desc = "PySceneDetect (Shot Keyframing)" if args.scene_detect else f"1 frame every {args.stride} frames"
-    use_line_log = is_kaggle_or_headless() if args.log_mode == "auto" else (args.log_mode == "line")
 
-    # Startup Configuration Table
-    cfg_table = Table(title="[bold green]AIC Indexer Configuration[/bold green]", box=box.ROUNDED)
-    cfg_table.add_column("Setting", style="bold cyan", width=20)
-    cfg_table.add_column("Value", style="white")
-    cfg_table.add_row("Input Videos", f"{len(video_files)} video(s) ({total_mb:.2f} MB)")
-    cfg_table.add_row("Output Path", str(output_path))
-    cfg_table.add_row("Pipeline Mode", mode_desc)
-    cfg_table.add_row("Hardware Workers", f"{num_workers} worker(s) ({', '.join(devices)})")
-    cfg_table.add_row("Model & Batch", f"{args.model} (conf={args.conf}, batch={args.batch_size})")
-    cfg_table.add_row("Log Mode", "Line (Kaggle/headless clean output)" if use_line_log else "Rich (interactive progress bar)")
-    console.print(cfg_table)
+    # Startup Configuration
+    print("=== AIC Indexer Configuration ===")
+    print(f"Input Videos     : {len(video_files)} video(s) ({total_mb:.2f} MB)")
+    print(f"Output Path      : {output_path}")
+    print(f"Pipeline Mode    : {mode_desc}")
+    print(f"Hardware Workers : {num_workers} worker(s) ({', '.join(devices)})")
+    print(f"Model & Batch    : {args.model} (conf={args.conf}, batch={args.batch_size})")
+    print("=================================\n", flush=True)
 
     # Partition video tasks round-robin across GPU workers
     worker_tasks: list[list[Path]] = [[] for _ in range(num_workers)]
@@ -579,173 +545,110 @@ def main() -> None:
     worker_finished_count = [0 for _ in range(num_workers)]
     active_worker_ids = {w for w in range(num_workers) if worker_total_tasks[w] > 0}
 
-    if use_line_log:
-        console.print("[dim]Starting line-mode progress updates...[/dim]\n")
-        worker_pending: dict[int, list[dict[str, Any]]] = {w: [] for w in range(num_workers)}
-        first_pending_time: float | None = None
+    print("Starting indexing progression...\n", flush=True)
+    worker_pending: dict[int, list[dict[str, Any]]] = {w: [] for w in range(num_workers)}
+    first_pending_time: float | None = None
 
-        def flush_block() -> None:
-            nonlocal first_pending_time
-            has_items = any(len(worker_pending[w]) > 0 for w in range(num_workers))
-            if not has_items:
-                return
+    def flush_block() -> None:
+        nonlocal first_pending_time
+        has_items = any(len(worker_pending[w]) > 0 for w in range(num_workers))
+        if not has_items:
+            return
 
-            elapsed_total = max(1e-4, time.perf_counter() - start_time_all)
-            elapsed_s = int(elapsed_total)
-            comp_mb = completed_bytes / (1024.0 * 1024.0)
+        elapsed_total = max(1e-4, time.perf_counter() - start_time_all)
+        elapsed_s = int(elapsed_total)
+        comp_mb = completed_bytes / (1024.0 * 1024.0)
 
-            # Header: [104s | 229.29 / 7184.48 MB]
-            console.print(f"[bold blue][{elapsed_s}s | {comp_mb:.2f} / {total_mb:.2f} MB][/bold blue]")
+        # Header: [104s | 229.29 / 7184.48 MB]
+        print(f"[{elapsed_s}s | {comp_mb:.2f} / {total_mb:.2f} MB]")
 
-            # Per-worker completed lines
-            for w in range(num_workers):
-                for item in worker_pending[w]:
-                    gpu_tag = escape(f"[{item['gpu_id']}]")
-                    v_name = escape(item["video_name"])
-                    pct = (item["video_global_idx"] / total_vids) * 100.0
-                    mb_size = item["file_size"] / (1024.0 * 1024.0)
+        # Per-worker completed lines
+        for w in range(num_workers):
+            for item in worker_pending[w]:
+                gpu_tag = f"[{item['gpu_id']}]"
+                v_name = item["video_name"]
+                pct = (item["video_global_idx"] / total_vids) * 100.0
+                mb_size = item["file_size"] / (1024.0 * 1024.0)
 
-                    if item["status"] == "ok":
-                        console.print(
-                            f">  [bold cyan]{gpu_tag}[/bold cyan] "
-                            f"[bold blue][{item['video_global_idx']:>{len(str(total_vids))}}/{total_vids} | {pct:>5.1f}%][/bold blue] "
-                            f"[bold white]{v_name}[/bold white] "
-                            f"| [green]{item['num_keyframes']} kf[/green] "
-                            f"| [yellow]{item['fps']} fps[/yellow] "
-                            f"| [magenta]{item['num_detections']} objs[/magenta] "
-                            f"| {mb_size:.1f} MB"
-                        )
-                    else:
-                        err_msg = escape(str(item["error_msg"] or "Unknown error"))
-                        errors.append((item["video_name"], err_msg))
-                        console.print(
-                            f">  [bold red]{gpu_tag}[/bold red] "
-                            f"[bold red][{item['video_global_idx']}/{total_vids} | FAIL][/bold red] "
-                            f"[bold white]{v_name}[/bold white] "
-                            f"| [bold red]{err_msg}[/bold red]"
-                        )
-                worker_pending[w].clear()
-
-            # Footer: [ETA: ..] averaged from worker ETAs
-            worker_etas: list[float] = []
-            for w in range(num_workers):
-                rem_w = worker_total_tasks[w] - worker_finished_count[w]
-                if rem_w > 0:
-                    if worker_finished_count[w] > 0:
-                        avg_time_w = elapsed_total / worker_finished_count[w]
-                        worker_etas.append(rem_w * avg_time_w)
-                    elif finished_videos > 0:
-                        avg_time_all = elapsed_total / finished_videos
-                        worker_etas.append(rem_w * avg_time_all)
-
-            if worker_etas:
-                eta_sec = int(sum(worker_etas) / len(worker_etas))
-                eta_str = f"{eta_sec // 60}m {eta_sec % 60:02d}s" if eta_sec >= 60 else f"{eta_sec}s"
-            else:
-                eta_str = "0s"
-
-            console.print(f"[bold cyan][ETA: {eta_str}][/bold cyan]\n")
-            first_pending_time = None
-
-        while active_workers > 0 or not result_queue.empty() or not progress_queue.empty():
-            try:
-                info = progress_queue.get(timeout=0.1)
-                completed_bytes += info["file_size"]
-                finished_videos += 1
-                total_keyframes_count += info["num_keyframes"]
-                total_detections_count += info["num_detections"]
-
-                w_id = info["worker_id"]
-                worker_finished_count[w_id] += 1
-                info["video_global_idx"] = finished_videos
-                worker_pending[w_id].append(info)
-
-                if worker_finished_count[w_id] >= worker_total_tasks[w_id]:
-                    active_worker_ids.discard(w_id)
-
-                if first_pending_time is None:
-                    first_pending_time = time.perf_counter()
-
-                all_active_reported = bool(active_worker_ids) and all(
-                    len(worker_pending[w]) > 0 for w in active_worker_ids
-                )
-                timed_out = (first_pending_time is not None) and (time.perf_counter() - first_pending_time > 10.0)
-
-                if all_active_reported or timed_out:
-                    flush_block()
-            except queue.Empty:
-                if first_pending_time is not None and (time.perf_counter() - first_pending_time > 10.0):
-                    flush_block()
-
-            try:
-                records = result_queue.get(timeout=0.1)
-                if records is None:
-                    active_workers -= 1
-                else:
-                    all_records.extend(records)
-            except queue.Empty:
-                pass
-
-        flush_block()
-    else:
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.fields[video_iter]}/{task.fields[total_videos]} vids", justify="right"),
-            BarColumn(bar_width=32),
-            TextColumn("[progress.percentage]{task.percentage:>5.1f}%"),
-            TextColumn("({task.completed:.2f} / {task.total:.2f} MB)"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[bold cyan]{task.fields[fps_stat]}"),
-            TextColumn("[dim]{task.fields[current_video]}"),
-            console=console,
-        )
-
-        with progress:
-            task_id = progress.add_task(
-                "indexing",
-                total=total_mb,
-                completed=0.0,
-                video_iter=0,
-                total_videos=total_vids,
-                current_video="Starting...",
-                fps_stat="-- fps",
-            )
-
-            while active_workers > 0 or not result_queue.empty() or not progress_queue.empty():
-                try:
-                    info = progress_queue.get(timeout=0.1)
-                    completed_bytes += info["file_size"]
-                    finished_videos += 1
-                    total_keyframes_count += info["num_keyframes"]
-                    total_detections_count += info["num_detections"]
-                    if info["status"] != "ok":
-                        errors.append((info["video_name"], info["error_msg"] or "Unknown error"))
-
-                    fps_stat = f"{info['fps']} fps" if info["status"] == "ok" else "error"
-                    progress.update(
-                        task_id,
-                        completed=completed_bytes / (1024.0 * 1024.0),
-                        video_iter=finished_videos,
-                        current_video=info["video_name"],
-                        fps_stat=fps_stat,
+                if item["status"] == "ok":
+                    print(
+                        f">  {gpu_tag} [{item['video_global_idx']:>{len(str(total_vids))}}/{total_vids} | {pct:>5.1f}%] "
+                        f"{v_name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb_size:.1f} MB"
                     )
-                except queue.Empty:
-                    pass
+                else:
+                    err_msg = str(item["error_msg"] or "Unknown error")
+                    errors.append((item["video_name"], err_msg))
+                    print(
+                        f">  {gpu_tag} [{item['video_global_idx']}/{total_vids} | FAIL] {v_name} | {err_msg}"
+                    )
+            worker_pending[w].clear()
 
-                try:
-                    records = result_queue.get(timeout=0.1)
-                    if records is None:
-                        active_workers -= 1
-                    else:
-                        all_records.extend(records)
-                except queue.Empty:
-                    pass
+        # Footer: [ETA: ..] averaged from worker ETAs
+        worker_etas: list[float] = []
+        for w in range(num_workers):
+            rem_w = worker_total_tasks[w] - worker_finished_count[w]
+            if rem_w > 0:
+                if worker_finished_count[w] > 0:
+                    avg_time_w = elapsed_total / worker_finished_count[w]
+                    worker_etas.append(rem_w * avg_time_w)
+                elif finished_videos > 0:
+                    avg_time_all = elapsed_total / finished_videos
+                    worker_etas.append(rem_w * avg_time_all)
+
+        if worker_etas:
+            eta_sec = int(sum(worker_etas) / len(worker_etas))
+            eta_str = f"{eta_sec // 60}m {eta_sec % 60:02d}s" if eta_sec >= 60 else f"{eta_sec}s"
+        else:
+            eta_str = "0s"
+
+        print(f"[ETA: {eta_str}]\n", flush=True)
+        first_pending_time = None
+
+    while active_workers > 0 or not result_queue.empty() or not progress_queue.empty():
+        try:
+            info = progress_queue.get(timeout=0.1)
+            completed_bytes += info["file_size"]
+            finished_videos += 1
+            total_keyframes_count += info["num_keyframes"]
+            total_detections_count += info["num_detections"]
+
+            w_id = info["worker_id"]
+            worker_finished_count[w_id] += 1
+            info["video_global_idx"] = finished_videos
+            worker_pending[w_id].append(info)
+
+            if worker_finished_count[w_id] >= worker_total_tasks[w_id]:
+                active_worker_ids.discard(w_id)
+
+            if first_pending_time is None:
+                first_pending_time = time.perf_counter()
+
+            all_active_reported = bool(active_worker_ids) and all(
+                len(worker_pending[w]) > 0 for w in active_worker_ids
+            )
+            timed_out = (first_pending_time is not None) and (time.perf_counter() - first_pending_time > 10.0)
+
+            if all_active_reported or timed_out:
+                flush_block()
+        except queue.Empty:
+            if first_pending_time is not None and (time.perf_counter() - first_pending_time > 10.0):
+                flush_block()
+
+        try:
+            records = result_queue.get(timeout=0.1)
+            if records is None:
+                active_workers -= 1
+            else:
+                all_records.extend(records)
+        except queue.Empty:
+            pass
+
+    flush_block()
 
     for p in processes:
         p.join()
 
-    console.print(f"[bold cyan]Saving index of {len(all_records)} keyframes to '{output_path}'...[/bold cyan]")
+    print(f"Saving index of {len(all_records)} keyframes to '{output_path}'...", flush=True)
     if all_records:
         df = pl.DataFrame(all_records)
     else:
@@ -776,27 +679,23 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
 
-    # Finish Summary Table
+    # Finish Summary
     total_elapsed = max(1e-3, time.perf_counter() - start_time_all)
     overall_fps = round(total_keyframes_count / total_elapsed, 1)
-
-    summary_table = Table(title="[bold green]Indexing Complete[/bold green]", box=box.ROUNDED)
-    summary_table.add_column("Metric", style="bold cyan")
-    summary_table.add_column("Result", style="white")
-
-    summary_table.add_row("Total Videos Processed", f"{finished_videos} / {total_vids}")
-    summary_table.add_row("Successful Videos", f"[green]{finished_videos - len(errors)}[/green]")
-    if errors:
-        summary_table.add_row("Failed Videos", f"[red]{len(errors)}[/red]")
-    summary_table.add_row("Total Keyframes Indexed", f"{total_keyframes_count:,}")
-    summary_table.add_row("Total Objects Detected", f"{total_detections_count:,}")
-    summary_table.add_row("Total Processing Time", f"{total_elapsed:.2f} s ({total_elapsed / 60:.1f} min)")
-    summary_table.add_row("Overall Throughput", f"{overall_fps} keyframes/sec")
     out_size_mb = output_path.stat().st_size / (1024.0 * 1024.0) if output_path.exists() else 0.0
-    summary_table.add_row("Parquet Output Path", str(output_path))
-    summary_table.add_row("Parquet File Size", f"{out_size_mb:.2f} MB ({out_size_mb * 1024:.1f} KB)")
 
-    console.print(summary_table)
+    print("=== Indexing Complete ===")
+    print(f"Total Videos Processed  : {finished_videos} / {total_vids}")
+    print(f"Successful Videos       : {finished_videos - len(errors)}")
+    if errors:
+        print(f"Failed Videos           : {len(errors)}")
+    print(f"Total Keyframes Indexed : {total_keyframes_count:,}")
+    print(f"Total Objects Detected  : {total_detections_count:,}")
+    print(f"Total Processing Time   : {total_elapsed:.2f} s ({total_elapsed / 60:.1f} min)")
+    print(f"Overall Throughput      : {overall_fps} keyframes/sec")
+    print(f"Parquet Output Path     : {output_path}")
+    print(f"Parquet File Size       : {out_size_mb:.2f} MB ({out_size_mb * 1024:.1f} KB)")
+    print("=========================", flush=True)
 
 
 if __name__ == "__main__":

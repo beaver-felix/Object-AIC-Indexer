@@ -298,114 +298,137 @@ def gpu_worker_process(
     max_scene_len: float,
 ) -> None:
     """Worker process dedicated to 1 GPU (e.g. cuda:0 or cuda:1 on Kaggle 2x T4)."""
-    import logging
-    logging.getLogger("ultralytics").setLevel(logging.WARNING)
-    logging.getLogger("scenedetect").setLevel(logging.WARNING)
+    processed_videos: list[Path] = []
+    try:
+        import logging
+        logging.getLogger("ultralytics").setLevel(logging.WARNING)
+        logging.getLogger("scenedetect").setLevel(logging.WARNING)
 
-    import torch
-    from ultralytics import YOLO
+        import torch
+        from ultralytics import YOLO
 
-    device = gpu_id
-    model = YOLO(model_name)
+        device = gpu_id
+        model = YOLO(model_name)
 
-    for video_file in video_tasks:
-        t_vid_start = time.perf_counter()
-        file_size = video_file.stat().st_size
-        video_id = video_file.stem
-        records: list[dict[str, Any]] = []
-        total_detections = 0
+        for video_file in video_tasks:
+            t_vid_start = time.perf_counter()
+            file_size = video_file.stat().st_size
+            video_id = video_file.stem
+            records: list[dict[str, Any]] = []
+            total_detections = 0
 
-        try:
-            # Extract frames: default 1 every N frames (default 10) or shot detection
-            if use_scenes:
-                try:
-                    shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
-                    keyframes_data, fps, width, height = extract_shot_keyframes(video_file, shots)
-                except Exception:
+            try:
+                # Extract frames: default 1 every N frames (default 10) or shot detection
+                if use_scenes:
+                    try:
+                        shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
+                        keyframes_data, fps, width, height = extract_shot_keyframes(video_file, shots)
+                    except Exception:
+                        keyframes_data, fps, width, height = extract_strided_frames(video_file, stride=stride)
+                else:
                     keyframes_data, fps, width, height = extract_strided_frames(video_file, stride=stride)
-            else:
-                keyframes_data, fps, width, height = extract_strided_frames(video_file, stride=stride)
 
-            if keyframes_data:
-                for b_start in range(0, len(keyframes_data), batch_size):
-                    batch_slice = keyframes_data[b_start : b_start + batch_size]
-                    b_imgs = [item[1] for item in batch_slice]
+                if keyframes_data:
+                    for b_start in range(0, len(keyframes_data), batch_size):
+                        batch_slice = keyframes_data[b_start : b_start + batch_size]
+                        b_imgs = [item[1] for item in batch_slice]
 
-                    # Run YOLO with Tensor Core FP16 acceleration
-                    results = model.predict(
-                        b_imgs,
-                        conf=conf_thresh,
-                        device=device,
-                        verbose=False,
-                    )
+                        # Run YOLO with Tensor Core FP16 acceleration
+                        results = model.predict(
+                            b_imgs,
+                            conf=conf_thresh,
+                            device=device,
+                            verbose=False,
+                        )
 
-                    for (shot_meta, f_img), det in zip(batch_slice, results):
-                        is_mono, dominant_colors = analyze_frame_colors(f_img)
+                        for (shot_meta, f_img), det in zip(batch_slice, results):
+                            is_mono, dominant_colors = analyze_frame_colors(f_img)
 
-                        b_labels: list[str] = []
-                        b_scores: list[float] = []
-                        b_boxes: list[list[float]] = []
+                            b_labels: list[str] = []
+                            b_scores: list[float] = []
+                            b_boxes: list[list[float]] = []
 
-                        if det.boxes is not None and len(det.boxes) > 0:
-                            confs = det.boxes.conf.cpu().numpy()
-                            clss = det.boxes.cls.cpu().numpy().astype(int)
-                            xyxy = det.boxes.xyxy.cpu().numpy()
+                            if det.boxes is not None and len(det.boxes) > 0:
+                                confs = det.boxes.conf.cpu().numpy()
+                                clss = det.boxes.cls.cpu().numpy().astype(int)
+                                xyxy = det.boxes.xyxy.cpu().numpy()
 
-                            h_img, w_img = f_img.shape[:2]
-                            for c_val, cl_id, box in zip(confs, clss, xyxy):
-                                label = str(det.names.get(cl_id, f"obj_{cl_id}"))
-                                y0 = float(box[1] / h_img)
-                                x0 = float(box[0] / w_img)
-                                y1 = float(box[3] / h_img)
-                                x1 = float(box[2] / w_img)
+                                h_img, w_img = f_img.shape[:2]
+                                for c_val, cl_id, box in zip(confs, clss, xyxy):
+                                    label = str(det.names.get(cl_id, f"obj_{cl_id}"))
+                                    y0 = float(box[1] / h_img)
+                                    x0 = float(box[0] / w_img)
+                                    y1 = float(box[3] / h_img)
+                                    x1 = float(box[2] / w_img)
 
-                                b_labels.append(label)
-                                b_scores.append(float(c_val))
-                                b_boxes.append([y0, x0, y1, x1])
+                                    b_labels.append(label)
+                                    b_scores.append(float(c_val))
+                                    b_boxes.append([y0, x0, y1, x1])
 
-                        txt_str = encode_positional_boxes(b_boxes, b_labels)
-                        obj_str = encode_object_counts(b_labels, b_scores)
-                        unique_objects = sorted(list(set(b_labels)))
-                        total_detections += len(b_labels)
+                            txt_str = encode_positional_boxes(b_boxes, b_labels)
+                            obj_str = encode_object_counts(b_labels, b_scores)
+                            unique_objects = sorted(list(set(b_labels)))
+                            total_detections += len(b_labels)
 
-                        records.append({
-                            "video_id": video_id,
-                            "time": float(shot_meta["middle_time"]),
-                            "frame_idx": int(shot_meta["middle_frame"]),
-                            "start_time": float(shot_meta["start_time"]),
-                            "end_time": float(shot_meta["end_time"]),
-                            "start_frame": int(shot_meta["start_frame"]),
-                            "end_frame": int(shot_meta["end_frame"]),
-                            "fps": float(round(fps, 2)),
-                            "width": int(width),
-                            "height": int(height),
-                            "objects": unique_objects,
-                            "scores": b_scores,
-                            "boxes": b_boxes,
-                            "labels": b_labels,
-                            "txt": txt_str,
-                            "objects_str": obj_str,
-                            "colors": dominant_colors,
-                            "is_monochrome": is_mono,
-                            "video_path": str(video_file),
-                        })
+                            records.append({
+                                "video_id": video_id,
+                                "time": float(shot_meta["middle_time"]),
+                                "frame_idx": int(shot_meta["middle_frame"]),
+                                "start_time": float(shot_meta["start_time"]),
+                                "end_time": float(shot_meta["end_time"]),
+                                "start_frame": int(shot_meta["start_frame"]),
+                                "end_frame": int(shot_meta["end_frame"]),
+                                "fps": float(round(fps, 2)),
+                                "width": int(width),
+                                "height": int(height),
+                                "objects": unique_objects,
+                                "scores": b_scores,
+                                "boxes": b_boxes,
+                                "labels": b_labels,
+                                "txt": txt_str,
+                                "objects_str": obj_str,
+                                "colors": dominant_colors,
+                                "is_monochrome": is_mono,
+                                "video_path": str(video_file),
+                            })
 
-            elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
-            result_queue.put(records)
-            progress_queue.put({
-                "worker_id": worker_id,
-                "gpu_id": gpu_id,
-                "video_name": video_file.name,
-                "file_size": file_size,
-                "num_keyframes": len(keyframes_data),
-                "num_detections": total_detections,
-                "elapsed_sec": elapsed_sec,
-                "fps": round(len(keyframes_data) / elapsed_sec, 1),
-                "status": "ok",
-                "error_msg": None,
-            })
-        except Exception as err:
-            elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
+                elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
+                result_queue.put(records)
+                progress_queue.put({
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "video_name": video_file.name,
+                    "file_size": file_size,
+                    "num_keyframes": len(keyframes_data),
+                    "num_detections": total_detections,
+                    "elapsed_sec": elapsed_sec,
+                    "fps": round(len(keyframes_data) / elapsed_sec, 1),
+                    "status": "ok",
+                    "error_msg": None,
+                })
+                processed_videos.append(video_file)
+            except Exception as err:
+                elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
+                result_queue.put([])
+                progress_queue.put({
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "video_name": video_file.name,
+                    "file_size": file_size,
+                    "num_keyframes": 0,
+                    "num_detections": 0,
+                    "elapsed_sec": elapsed_sec,
+                    "fps": 0.0,
+                    "status": "error",
+                    "error_msg": str(err),
+                })
+                processed_videos.append(video_file)
+    except Exception as fatal_err:
+        # Fatal: model failed to load, import error, or unexpected crash
+        # Report all remaining unprocessed videos as failed
+        remaining = [v for v in video_tasks if v not in processed_videos]
+        for video_file in remaining:
+            file_size = video_file.stat().st_size if video_file.exists() else 0
             result_queue.put([])
             progress_queue.put({
                 "worker_id": worker_id,
@@ -414,13 +437,14 @@ def gpu_worker_process(
                 "file_size": file_size,
                 "num_keyframes": 0,
                 "num_detections": 0,
-                "elapsed_sec": elapsed_sec,
+                "elapsed_sec": 0.0,
                 "fps": 0.0,
                 "status": "error",
-                "error_msg": str(err),
+                "error_msg": f"FATAL worker crash: {fatal_err}",
             })
-
-    result_queue.put(None)
+    finally:
+        # Always send sentinel so main loop never deadlocks
+        result_queue.put(None)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -540,6 +564,8 @@ def main() -> None:
     total_vids = len(video_files)
     active_workers = len(processes)
     start_time_all = time.perf_counter()
+    save_interval = max(1, min(10, total_vids // 5))  # Incremental save frequency
+    last_save_count = 0
 
     worker_total_tasks = [len(worker_tasks[w]) for w in range(num_workers)]
     worker_finished_count = [0 for _ in range(num_workers)]
@@ -640,8 +666,23 @@ def main() -> None:
                 active_workers -= 1
             else:
                 all_records.extend(records)
+                # Incremental parquet save to survive forced kills
+                if all_records and finished_videos - last_save_count >= save_interval:
+                    try:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        pl.DataFrame(all_records).write_parquet(output_path, compression="zstd")
+                        last_save_count = finished_videos
+                    except Exception as save_err:
+                        print(f"WARNING: Incremental save failed: {save_err}", file=sys.stderr, flush=True)
         except queue.Empty:
             pass
+
+        # Liveness check: detect crashed workers whose sentinel was lost
+        if active_workers > 0:
+            alive_count = sum(1 for p in processes if p.is_alive())
+            if alive_count == 0 and result_queue.empty() and progress_queue.empty():
+                print("WARNING: All worker processes died unexpectedly. Saving partial results.", file=sys.stderr, flush=True)
+                active_workers = 0
 
     flush_block()
 

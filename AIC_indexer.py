@@ -9,20 +9,14 @@
 #     "scenedetect",
 # ]
 # ///
-"""
-AIC_indexer.py: High-throughput Video Object & Scene Indexer matching VISIONE Advanced Mode.
-Optimized for multi-GPU setups (e.g. Kaggle 2x T4) with PySceneDetect keyframing and YOLO detection.
-Outputs to obj-idx.parquet with shot boundaries, timestamps, 7x7 spatial grid tokens, and surrogate strings.
-"""
+"""AIC_indexer.py: Multi-GPU Video Indexer for VISIONE obj-idx Parquet."""
 
 from __future__ import annotations
 
 import argparse
-import collections
-from datetime import datetime
+from collections import Counter
 import math
 import multiprocessing as mp
-import os
 from pathlib import Path
 import queue
 import sys
@@ -33,11 +27,7 @@ import cv2
 import numpy as np
 import polars as pl
 
-
-VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".webm",
-    ".flv", ".wmv", ".m4v", ".ts", ".mts", ".m2ts"
-}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v", ".ts", ".mts", ".m2ts"}
 
 COLOR_RANGES = [
     ("black",  (0, 0, 0),       (180, 255, 45)),
@@ -53,697 +43,376 @@ COLOR_RANGES = [
     ("pink",   (146, 70, 50),   (169, 255, 255)),
 ]
 
-
-def encode_positional_boxes(
-    boxes_yxyx: list[list[float]],
-    labels: list[str],
-    nrows: int = 7,
-    ncols: int = 7,
-    rtol: float = 0.1,
-) -> str:
-    """Encode bounding boxes into VISIONE 7x7 spatial grid tokens (e.g. '2ccar')."""
-    tokens: list[str] = []
-    xtol = rtol / ncols
-    ytol = rtol / nrows
-
-    for (y0, x0, y1, x1), label in zip(boxes_yxyx, labels):
-        clean_label = label.lower().replace(" ", "_")
-        start_col = math.floor((max(0.0, x0) + xtol) * ncols)
-        start_row = math.floor((max(0.0, y0) + ytol) * nrows)
-        end_col = math.floor((min(1.0, x1) - xtol) * ncols)
-        end_row = math.floor((min(1.0, y1) - ytol) * nrows)
-
-        for r in range(max(0, start_row), min(nrows, end_row + 1)):
-            for c in range(max(0, start_col), min(ncols, end_col + 1)):
-                col_char = chr(ord("a") + c)
-                tokens.append(f"{r}{col_char}{clean_label}")
-
-    tokens.sort()
-    return " ".join(tokens)
+SCHEMA = {
+    "video_id": pl.Utf8, "time": pl.Float64, "frame_idx": pl.Int64,
+    "start_time": pl.Float64, "end_time": pl.Float64, "start_frame": pl.Int64, "end_frame": pl.Int64,
+    "fps": pl.Float32, "width": pl.Int32, "height": pl.Int32,
+    "objects": pl.List(pl.Utf8), "scores": pl.List(pl.Float32), "boxes": pl.List(pl.List(pl.Float32)),
+    "labels": pl.List(pl.Utf8), "txt": pl.Utf8, "objects_str": pl.Utf8,
+    "colors": pl.List(pl.Utf8), "is_monochrome": pl.Boolean, "video_path": pl.Utf8,
+}
 
 
-def encode_object_counts(
-    labels: list[str],
-    scores: list[float],
-) -> str:
+def encode_positional_boxes(boxes: list[list[float]], labels: list[str], n: int = 7, tol: float = 0.1) -> str:
+    """Encode bounding boxes into VISIONE 7x7 spatial tokens (e.g. '2ccar')."""
+    tokens = []
+    dt = tol / n
+    for (y0, x0, y1, x1), label in zip(boxes, labels):
+        lbl = label.lower().replace(" ", "_")
+        c0, r0 = math.floor((max(0.0, x0) + dt) * n), math.floor((max(0.0, y0) + dt) * n)
+        c1, r1 = math.floor((min(1.0, x1) - dt) * n), math.floor((min(1.0, y1) - dt) * n)
+        tokens.extend(f"{r}{chr(97 + c)}{lbl}" for r in range(max(0, r0), min(n, r1 + 1)) for c in range(max(0, c0), min(n, c1 + 1)))
+    return " ".join(sorted(tokens))
+
+
+def encode_object_counts(labels: list[str], scores: list[float]) -> str:
     """Encode object counts into VISIONE surrogate text format (e.g. '4wcperson1|6')."""
-    counts: collections.Counter[str] = collections.Counter()
-    tokens: list[str] = []
-
+    counts: Counter[str] = Counter()
+    tokens = []
     for label, score in zip(labels, scores):
-        clean_label = label.lower().replace(" ", "_")
-        counts[clean_label] += 1
-        cnt = counts[clean_label]
-        freq = max(1, int(10.0 * score / 2.0 + 2.0))
-        tokens.append(f"4wc{clean_label}{cnt}|{freq}")
-
-    tokens.sort()
-    return " ".join(tokens)
+        lbl = label.lower().replace(" ", "_")
+        counts[lbl] += 1
+        tokens.append(f"4wc{lbl}{counts[lbl]}|{max(1, int(5.0 * score + 2.0))}")
+    return " ".join(sorted(tokens))
 
 
 def analyze_frame_colors(frame_bgr: np.ndarray) -> tuple[bool, list[str]]:
     """Analyze frame color palette and detect monochrome/grayscale."""
     small = cv2.resize(frame_bgr, (64, 64), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-    sat = hsv[:, :, 1]
-    is_monochrome = float(np.mean(sat)) < 22.0
-
-    if is_monochrome:
+    if float(np.mean(hsv[:, :, 1])) < 22.0:
         return True, ["monochrome"]
-
-    detected_colors: list[str] = []
-    total_pixels = small.shape[0] * small.shape[1]
-    for color_name, lower, upper in COLOR_RANGES:
-        mask = cv2.inRange(hsv, np.array(lower, dtype=np.uint8), np.array(upper, dtype=np.uint8))
-        pixel_count = int(cv2.countNonZero(mask))
-        if pixel_count / total_pixels >= 0.08:
-            if color_name not in detected_colors:
-                detected_colors.append(color_name)
-
-    return False, detected_colors
+    colors = []
+    for name, low, high in COLOR_RANGES:
+        mask = cv2.inRange(hsv, np.array(low, dtype=np.uint8), np.array(high, dtype=np.uint8))
+        if cv2.countNonZero(mask) >= 327 and name not in colors:  # 64*64*0.08 = 327.68
+            colors.append(name)
+    return False, colors
 
 
-def detect_scenes_and_keyframes(
-    video_path: Path,
-    max_scene_len_sec: float = 10.0,
-    adaptive_threshold: float = 3.0,
-) -> list[dict[str, Any]]:
-    """
-    VISIONE-matching scene detection using PySceneDetect.
-    Splits video into shots, partitions long shots by max_scene_len_sec,
-    and calculates middle keyframe for each shot.
-    """
+def detect_scenes_and_keyframes(video_path: Path, max_scene_len_sec: float = 10.0, thresh: float = 3.0) -> list[dict[str, Any]]:
+    """Detect scenes with PySceneDetect, partition long shots, return keyframe metadata."""
     from scenedetect import open_video, SceneManager
     from scenedetect.detectors import AdaptiveDetector
 
     video = open_video(str(video_path))
-    scene_manager = SceneManager()
-    scene_manager.add_detector(AdaptiveDetector(adaptive_threshold=adaptive_threshold))
-    scene_manager.detect_scenes(video)
-    raw_scenes = scene_manager.get_scene_list()
+    sm = SceneManager()
+    sm.add_detector(AdaptiveDetector(adaptive_threshold=thresh))
+    sm.detect_scenes(video)
+    raw = sm.get_scene_list() or [(video.base_timecode, video.duration)]
 
     fps = float(video.frame_rate) if video.frame_rate > 0 else 25.0
-    total_frames = int(video.duration.get_frames())
-
-    # Fallback if no scenes detected: treat whole video as one shot
-    if not raw_scenes:
-        raw_scenes = [(video.base_timecode, video.duration)]
-
-    shots: list[dict[str, Any]] = []
-
-    for start_tc, end_tc in raw_scenes:
-        s_frame = start_tc.get_frames()
-        e_frame = max(s_frame, end_tc.get_frames() - 1)
-        s_sec = start_tc.get_seconds()
-        e_sec = end_tc.get_seconds()
-        duration_sec = e_sec - s_sec
-
-        # Partition long scenes into sub-scenes like VISIONE post_process_scenes.py
-        if max_scene_len_sec > 0 and duration_sec > max_scene_len_sec:
-            num_sub = math.ceil(duration_sec / max_scene_len_sec)
-            sub_len_frames = (e_frame - s_frame + 1) / num_sub
-            for i in range(num_sub):
-                sub_s_frame = int(round(s_frame + i * sub_len_frames))
-                sub_e_frame = int(round(s_frame + (i + 1) * sub_len_frames - 1))
-                sub_e_frame = min(sub_e_frame, e_frame)
-                mid_frame = (sub_s_frame + sub_e_frame) // 2
-
-                shots.append({
-                    "start_frame": sub_s_frame,
-                    "end_frame": sub_e_frame,
-                    "start_time": round(sub_s_frame / fps, 3),
-                    "end_time": round(sub_e_frame / fps, 3),
-                    "middle_frame": mid_frame,
-                    "middle_time": round(mid_frame / fps, 3),
-                })
+    shots = []
+    for s_tc, e_tc in raw:
+        sf, ef = s_tc.get_frames(), max(s_tc.get_frames(), e_tc.get_frames() - 1)
+        dur = e_tc.get_seconds() - s_tc.get_seconds()
+        if max_scene_len_sec > 0 and dur > max_scene_len_sec:
+            k = math.ceil(dur / max_scene_len_sec)
+            step = (ef - sf + 1) / k
+            for i in range(k):
+                s, e = int(round(sf + i * step)), min(ef, int(round(sf + (i + 1) * step - 1)))
+                m = (s + e) // 2
+                shots.append({"start_frame": s, "end_frame": e, "start_time": round(s / fps, 3), "end_time": round(e / fps, 3), "middle_frame": m, "middle_time": round(m / fps, 3)})
         else:
-            mid_frame = (s_frame + e_frame) // 2
-            shots.append({
-                "start_frame": s_frame,
-                "end_frame": e_frame,
-                "start_time": round(s_sec, 3),
-                "end_time": round(e_sec, 3),
-                "middle_frame": mid_frame,
-                "middle_time": round((s_sec + e_sec) / 2.0, 3),
-            })
-
+            m = (sf + ef) // 2
+            shots.append({"start_frame": sf, "end_frame": ef, "start_time": round(s_tc.get_seconds(), 3), "end_time": round(e_tc.get_seconds(), 3), "middle_frame": m, "middle_time": round((s_tc.get_seconds() + e_tc.get_seconds()) / 2.0, 3)})
     return shots
 
 
-def extract_shot_keyframes(
-    video_path: Path,
-    shots: list[dict[str, Any]],
-) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
-    """Read representative keyframes from video according to shot bounds."""
+def extract_shot_keyframes(video_path: Path, shots: list[dict[str, Any]]) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
+    """Read keyframes from video corresponding to detected shots."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return [], 0.0, 0, 0
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # Sort shots by middle frame to read sequentially
-    sorted_shots = sorted(shots, key=lambda s: s["middle_frame"])
-    results: list[tuple[dict[str, Any], np.ndarray]] = []
-
-    target_map = {s["middle_frame"]: s for s in sorted_shots}
-    current_frame = 0
-
-    # Sequential scan with fast seek when gaps are large
-    for shot in sorted_shots:
-        target_f = shot["middle_frame"]
-        if target_f - current_frame > 30:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
-            current_frame = target_f
-
-        while current_frame < target_f:
-            ret = cap.grab()
-            if not ret:
-                break
-            current_frame += 1
-
+    fps, w, h = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    results, cur = [], 0
+    for shot in sorted(shots, key=lambda s: s["middle_frame"]):
+        target = shot["middle_frame"]
+        if target - cur > 30:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            cur = target
+        while cur < target and cap.grab():
+            cur += 1
         ret, frame = cap.read()
-        if ret and frame is not None:
-            results.append((shot, frame))
-            current_frame += 1
-        else:
+        if not ret or frame is None:
             break
-
+        results.append((shot, frame))
+        cur += 1
     cap.release()
-    return results, fps, width, height
+    return results, fps, w, h
 
 
-def extract_strided_frames(
-    video_path: Path,
-    stride: int = 10,
-) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
-    """
-    Extract 1 frame every N frames (default: 10 frames).
-    Uses fast cap.grab() skipping to avoid decoding unneeded frames.
-    """
+def extract_strided_frames(video_path: Path, stride: int = 10) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
+    """Extract frames at fixed stride using fast cap.grab() frame skipping."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return [], 0.0, 0, 0
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps, w, h = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     stride = max(1, int(stride))
-
-    results: list[tuple[dict[str, Any], np.ndarray]] = []
-    f_idx = 0
-
+    results, idx = [], 0
     while True:
-        if f_idx % stride == 0:
+        if idx % stride == 0:
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
-            msec = cap.get(cv2.CAP_PROP_POS_MSEC)
-            t_sec = float(msec / 1000.0) if msec > 0 else float(f_idx / fps)
-            shot_meta = {
-                "start_frame": max(0, f_idx - stride // 2),
-                "end_frame": f_idx + stride // 2,
-                "start_time": round(max(0.0, (f_idx - stride // 2) / fps), 3),
-                "end_time": round((f_idx + stride // 2) / fps, 3),
-                "middle_frame": f_idx,
-                "middle_time": round(t_sec, 3),
-            }
-            results.append((shot_meta, frame))
-        else:
-            # Fast grab without decoding pixel buffer
-            ret = cap.grab()
-            if not ret:
-                break
-
-        f_idx += 1
-
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            t = float(ms / 1000.0) if ms > 0 else float(idx / fps)
+            results.append(({
+                "start_frame": max(0, idx - stride // 2), "end_frame": idx + stride // 2,
+                "start_time": round(max(0.0, (idx - stride // 2) / fps), 3), "end_time": round((idx + stride // 2) / fps, 3),
+                "middle_frame": idx, "middle_time": round(t, 3),
+            }, frame))
+        elif not cap.grab():
+            break
+        idx += 1
     cap.release()
-    return results, fps, width, height
+    return results, fps, w, h
 
 
 def gpu_worker_process(
-    worker_id: int,
-    gpu_id: str,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    progress_queue: mp.Queue,
-    model_name: str,
-    conf_thresh: float,
-    batch_size: int,
-    use_scenes: bool,
-    stride: int,
-    max_scene_len: float,
+    worker_id: int, gpu_id: str, task_q: mp.Queue, res_q: mp.Queue, prog_q: mp.Queue,
+    model_name: str, conf: float, batch_size: int, use_scenes: bool, stride: int, max_scene_len: float,
 ) -> None:
-    """Worker process dedicated to 1 GPU. Pulls videos from shared queue dynamically."""
+    """Worker process: pulls videos from queue, runs YOLO, pushes records."""
     try:
         import logging
         logging.getLogger("ultralytics").setLevel(logging.WARNING)
         logging.getLogger("scenedetect").setLevel(logging.WARNING)
-
-        import torch
         from ultralytics import YOLO
 
-        device = gpu_id
         model = YOLO(model_name)
-
         while True:
             try:
-                video_file = task_queue.get_nowait()
+                video_file = task_q.get_nowait()
             except queue.Empty:
                 break
 
-            t_vid_start = time.perf_counter()
-            file_size = video_file.stat().st_size
-            video_id = video_file.stem
-            records: list[dict[str, Any]] = []
-            total_detections = 0
-
-            # Notify main loop which video this worker started
-            progress_queue.put({
-                "worker_id": worker_id,
-                "gpu_id": gpu_id,
-                "video_name": video_file.name,
-                "status": "started",
-            })
-
+            t0, fsize, vid = time.perf_counter(), video_file.stat().st_size, video_file.stem
+            prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "status": "started"})
             try:
-                # Extract frames: default 1 every N frames (default 10) or shot detection
                 if use_scenes:
                     try:
                         shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
-                        keyframes_data, fps, width, height = extract_shot_keyframes(video_file, shots)
+                        kfs, fps, w, h = extract_shot_keyframes(video_file, shots)
                     except Exception:
-                        keyframes_data, fps, width, height = extract_strided_frames(video_file, stride=stride)
+                        kfs, fps, w, h = extract_strided_frames(video_file, stride=stride)
                 else:
-                    keyframes_data, fps, width, height = extract_strided_frames(video_file, stride=stride)
+                    kfs, fps, w, h = extract_strided_frames(video_file, stride=stride)
 
-                if keyframes_data:
-                    for b_start in range(0, len(keyframes_data), batch_size):
-                        batch_slice = keyframes_data[b_start : b_start + batch_size]
-                        b_imgs = [item[1] for item in batch_slice]
+                records, n_det = [], 0
+                for b_start in range(0, len(kfs), batch_size):
+                    batch = kfs[b_start : b_start + batch_size]
+                    results = model.predict([item[1] for item in batch], conf=conf, device=gpu_id, verbose=False)
+                    for (meta, img), det in zip(batch, results):
+                        mono, colors = analyze_frame_colors(img)
+                        b_lbls, b_scs, b_boxes = [], [], []
+                        if det.boxes is not None and len(det.boxes) > 0:
+                            ih, iw = img.shape[:2]
+                            for c_val, cl_id, box in zip(det.boxes.conf.cpu().numpy(), det.boxes.cls.cpu().numpy().astype(int), det.boxes.xyxy.cpu().numpy()):
+                                b_lbls.append(str(det.names.get(cl_id, f"obj_{cl_id}")))
+                                b_scs.append(float(c_val))
+                                b_boxes.append([float(box[1] / ih), float(box[0] / iw), float(box[3] / ih), float(box[2] / iw)])
+                        n_det += len(b_lbls)
+                        records.append({
+                            "video_id": vid, "time": float(meta["middle_time"]), "frame_idx": int(meta["middle_frame"]),
+                            "start_time": float(meta["start_time"]), "end_time": float(meta["end_time"]),
+                            "start_frame": int(meta["start_frame"]), "end_frame": int(meta["end_frame"]),
+                            "fps": float(round(fps, 2)), "width": int(w), "height": int(h),
+                            "objects": sorted(list(set(b_lbls))), "scores": b_scs, "boxes": b_boxes, "labels": b_lbls,
+                            "txt": encode_positional_boxes(b_boxes, b_lbls), "objects_str": encode_object_counts(b_lbls, b_scs),
+                            "colors": colors, "is_monochrome": mono, "video_path": str(video_file),
+                        })
 
-                        # Run YOLO with Tensor Core FP16 acceleration
-                        results = model.predict(
-                            b_imgs,
-                            conf=conf_thresh,
-                            device=device,
-                            verbose=False,
-                        )
-
-                        for (shot_meta, f_img), det in zip(batch_slice, results):
-                            is_mono, dominant_colors = analyze_frame_colors(f_img)
-
-                            b_labels: list[str] = []
-                            b_scores: list[float] = []
-                            b_boxes: list[list[float]] = []
-
-                            if det.boxes is not None and len(det.boxes) > 0:
-                                confs = det.boxes.conf.cpu().numpy()
-                                clss = det.boxes.cls.cpu().numpy().astype(int)
-                                xyxy = det.boxes.xyxy.cpu().numpy()
-
-                                h_img, w_img = f_img.shape[:2]
-                                for c_val, cl_id, box in zip(confs, clss, xyxy):
-                                    label = str(det.names.get(cl_id, f"obj_{cl_id}"))
-                                    y0 = float(box[1] / h_img)
-                                    x0 = float(box[0] / w_img)
-                                    y1 = float(box[3] / h_img)
-                                    x1 = float(box[2] / w_img)
-
-                                    b_labels.append(label)
-                                    b_scores.append(float(c_val))
-                                    b_boxes.append([y0, x0, y1, x1])
-
-                            txt_str = encode_positional_boxes(b_boxes, b_labels)
-                            obj_str = encode_object_counts(b_labels, b_scores)
-                            unique_objects = sorted(list(set(b_labels)))
-                            total_detections += len(b_labels)
-
-                            records.append({
-                                "video_id": video_id,
-                                "time": float(shot_meta["middle_time"]),
-                                "frame_idx": int(shot_meta["middle_frame"]),
-                                "start_time": float(shot_meta["start_time"]),
-                                "end_time": float(shot_meta["end_time"]),
-                                "start_frame": int(shot_meta["start_frame"]),
-                                "end_frame": int(shot_meta["end_frame"]),
-                                "fps": float(round(fps, 2)),
-                                "width": int(width),
-                                "height": int(height),
-                                "objects": unique_objects,
-                                "scores": b_scores,
-                                "boxes": b_boxes,
-                                "labels": b_labels,
-                                "txt": txt_str,
-                                "objects_str": obj_str,
-                                "colors": dominant_colors,
-                                "is_monochrome": is_mono,
-                                "video_path": str(video_file),
-                            })
-
-                elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
-                result_queue.put(records)
-                progress_queue.put({
-                    "worker_id": worker_id,
-                    "gpu_id": gpu_id,
-                    "video_name": video_file.name,
-                    "file_size": file_size,
-                    "num_keyframes": len(keyframes_data),
-                    "num_detections": total_detections,
-                    "elapsed_sec": elapsed_sec,
-                    "fps": round(len(keyframes_data) / elapsed_sec, 1),
-                    "status": "ok",
-                    "error_msg": None,
-                })
+                el = max(1e-4, time.perf_counter() - t0)
+                res_q.put(records)
+                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": len(kfs), "num_detections": n_det, "fps": round(len(kfs) / el, 1), "status": "ok", "error_msg": None})
             except Exception as err:
-                elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
-                result_queue.put([])
-                progress_queue.put({
-                    "worker_id": worker_id,
-                    "gpu_id": gpu_id,
-                    "video_name": video_file.name,
-                    "file_size": file_size,
-                    "num_keyframes": 0,
-                    "num_detections": 0,
-                    "elapsed_sec": elapsed_sec,
-                    "fps": 0.0,
-                    "status": "error",
-                    "error_msg": str(err),
-                })
-    except Exception as fatal_err:
-        # Fatal: model failed to load, import error, or unexpected crash
-        progress_queue.put({
-            "worker_id": worker_id,
-            "gpu_id": gpu_id,
-            "video_name": "<fatal>",
-            "file_size": 0,
-            "num_keyframes": 0,
-            "num_detections": 0,
-            "elapsed_sec": 0.0,
-            "fps": 0.0,
-            "status": "error",
-            "error_msg": f"FATAL worker crash: {fatal_err}",
-        })
+                el = max(1e-4, time.perf_counter() - t0)
+                res_q.put([])
+                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": 0, "num_detections": 0, "fps": 0.0, "status": "error", "error_msg": str(err)})
+    except Exception as fatal:
+        prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": "<fatal>", "file_size": 0, "num_keyframes": 0, "num_detections": 0, "fps": 0.0, "status": "error", "error_msg": f"FATAL: {fatal}"})
     finally:
-        # Always send sentinel so main loop never deadlocks
-        result_queue.put(("SENTINEL", worker_id))
+        res_q.put(("SENTINEL", worker_id))
 
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="AIC_indexer.py: Index videos to obj-idx.parquet matching VISIONE advanced mode."
-    )
-    parser.add_argument("inputs", nargs="*", default=[], help="Video files or directories.")
-    parser.add_argument("-r", "--recursive", nargs="*", default=None, help="Scan folders recursively.")
-    parser.add_argument("-o", "--output", default="obj-idx.parquet", help="Output parquet path (default: obj-idx.parquet).")
-    parser.add_argument("--stride", type=int, default=10, help="Sample 1 frame every N frames (default: 10).")
-    parser.add_argument("--scene-detect", action="store_true", default=False, help="Use PySceneDetect shot keyframing instead of frame stride.")
-    parser.add_argument("--max-scene-len", type=float, default=10.0, help="Max shot duration in seconds before partitioning (default: 10.0).")
-    parser.add_argument("--model", default="yolo26x.pt", help="YOLO model path or name (default: yolo26x.pt).")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25).")
-    parser.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
-    parser.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs to use (0 = auto-detect all available GPUs e.g. 2 on Kaggle).")
-    return parser.parse_args()
-
-
-def collect_video_files(inputs: list[str], recursive_arg: list[str] | None) -> list[Path]:
-    files: list[Path] = []
-    is_recursive_mode = recursive_arg is not None
-
-    def scan_dir(dir_path: Path, recursive: bool) -> list[Path]:
-        pattern = "**/*" if recursive else "*"
-        return [
-            p.resolve()
-            for p in dir_path.glob(pattern)
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-        ]
-
-    for raw in inputs:
-        p = Path(raw).resolve()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+def collect_video_files(inputs: list[str], recursive_dirs: list[str] | None) -> list[Path]:
+    """Scan and deduplicate video files from explicit paths and recursive folders."""
+    files = []
+    targets = [(Path(p).resolve(), False) for p in inputs]
+    if recursive_dirs:
+        targets.extend((Path(p).resolve(), True) for p in recursive_dirs)
+    for p, rec in targets:
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
             files.append(p)
         elif p.is_dir():
-            files.extend(scan_dir(p, recursive=is_recursive_mode))
-
-    if recursive_arg is not None:
-        for raw in recursive_arg:
-            p = Path(raw).resolve()
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
-                files.append(p)
-            elif p.is_dir():
-                files.extend(scan_dir(p, recursive=True))
-
+            files.extend(f.resolve() for f in p.glob("**/*" if (rec or recursive_dirs is not None) else "*") if f.is_file() and f.suffix.lower() in VIDEO_EXTS)
     return list(dict.fromkeys(files))
 
 
-def main() -> None:
-    args = parse_arguments()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="AIC_indexer.py: Multi-GPU Video Indexer for VISIONE obj-idx Parquet.")
+    p.add_argument("inputs", nargs="*", default=[], help="Video files or directories.")
+    p.add_argument("-r", "--recursive", nargs="*", default=None, help="Scan folders recursively.")
+    p.add_argument("-o", "--output", default="obj-idx.parquet", help="Output parquet path.")
+    p.add_argument("--stride", type=int, default=10, help="Sample 1 frame every N frames (default: 10).")
+    p.add_argument("--scene-detect", action="store_true", default=False, help="Use PySceneDetect shot keyframing.")
+    p.add_argument("--max-scene-len", type=float, default=10.0, help="Max shot duration in seconds (default: 10.0).")
+    p.add_argument("--model", default="yolo26x.pt", help="YOLO model path or name (default: yolo26x.pt).")
+    p.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25).")
+    p.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
+    p.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs (0 = auto-detect all available).")
+    return p.parse_args()
 
-    video_files = collect_video_files(args.inputs, args.recursive)
-    if not video_files:
+
+def main() -> None:
+    args = parse_args()
+    v_files = collect_video_files(args.inputs, args.recursive)
+    if not v_files:
         print("No valid video files found to index.", file=sys.stderr)
         sys.exit(1)
 
-    output_path = Path(args.output).resolve()
-    total_bytes = sum(f.stat().st_size for f in video_files)
-    total_mb = total_bytes / (1024.0 * 1024.0)
+    out_path = Path(args.output).resolve()
+    tot_bytes = sum(f.stat().st_size for f in v_files)
+    tot_mb = tot_bytes / (1024.0 * 1024.0)
 
-    # Multi-GPU detection (Kaggle 2x T4 optimization)
     import torch
-    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    num_workers = args.num_gpus if args.num_gpus > 0 else max(1, available_gpus)
-    devices = [f"cuda:{i}" for i in range(num_workers)] if available_gpus > 0 else ["cpu"] * num_workers
+    n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    n_workers = args.num_gpus if args.num_gpus > 0 else max(1, n_cuda)
+    devices = [f"cuda:{i}" for i in range(n_workers)] if n_cuda > 0 else ["cpu"] * n_workers
 
-    mode_desc = "PySceneDetect (Shot Keyframing)" if args.scene_detect else f"1 frame every {args.stride} frames"
-
-    # Startup Configuration
     print("=== AIC Indexer Configuration ===")
-    print(f"Input Videos     : {len(video_files)} video(s) ({total_mb:.2f} MB)")
-    print(f"Output Path      : {output_path}")
-    print(f"Pipeline Mode    : {mode_desc}")
-    print(f"Hardware Workers : {num_workers} worker(s) ({', '.join(devices)})")
+    print(f"Input Videos     : {len(v_files)} video(s) ({tot_mb:.2f} MB)")
+    print(f"Output Path      : {out_path}")
+    print(f"Pipeline Mode    : {'PySceneDetect' if args.scene_detect else f'1 frame / {args.stride} frames'}")
+    print(f"Hardware Workers : {n_workers} worker(s) ({', '.join(devices)})")
     print(f"Model & Batch    : {args.model} (conf={args.conf}, batch={args.batch_size})")
     print("=================================\n", flush=True)
 
-    # Shared work queue — workers pull dynamically for perfect load balancing
     ctx = mp.get_context("spawn")
-    task_queue = ctx.Queue()
-    for v_file in video_files:
-        task_queue.put(v_file)
+    task_q, res_q, prog_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    for f in v_files:
+        task_q.put(f)
 
-    result_queue = ctx.Queue()
-    progress_queue = ctx.Queue()
-
-    processes = []
-    for w_id in range(num_workers):
-        p = ctx.Process(
-            target=gpu_worker_process,
-            args=(
-                w_id,
-                devices[w_id],
-                task_queue,
-                result_queue,
-                progress_queue,
-                args.model,
-                args.conf,
-                args.batch_size,
-                args.scene_detect,
-                args.stride,
-                args.max_scene_len,
-            ),
-        )
+    procs = [
+        ctx.Process(target=gpu_worker_process, args=(i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len))
+        for i in range(n_workers)
+    ]
+    for p in procs:
         p.start()
-        processes.append(p)
 
-    all_records: list[dict[str, Any]] = []
-    completed_bytes = 0
-    finished_videos = 0
-    total_keyframes_count = 0
-    total_detections_count = 0
-    errors: list[tuple[str, str]] = []
-    total_vids = len(video_files)
-    active_workers = len(processes)
-    start_time_all = time.perf_counter()
-    last_save_count = 0
+    records: list[dict[str, Any]] = []
+    comp_bytes = n_vids = tot_kfs = tot_dets = 0
+    errs: list[tuple[str, str]] = []
+    active_procs = len(procs)
+    t_start = time.perf_counter()
 
-    worker_finished_count = [0 for _ in range(num_workers)]
-    active_worker_ids = set(range(num_workers))
-    dead_workers: set[int] = set()
-    worker_current_video: dict[int, str] = {}  # track in-progress video per worker
-
-    print("Starting indexing progression...\n", flush=True)
-    worker_pending: dict[int, list[dict[str, Any]]] = {w: [] for w in range(num_workers)}
-    first_pending_time: float | None = None
+    active_w = set(range(n_workers))
+    dead_w: set[int] = set()
+    cur_vid: dict[int, str] = {}
+    pending: dict[int, list[dict[str, Any]]] = {w: [] for w in range(n_workers)}
+    t_first_pending: float | None = None
 
     def flush_block() -> None:
-        nonlocal first_pending_time
-        has_items = any(len(worker_pending[w]) > 0 for w in range(num_workers))
-        if not has_items:
+        nonlocal t_first_pending
+        if not any(pending[w] for w in range(n_workers)):
             return
 
-        elapsed_total = max(1e-4, time.perf_counter() - start_time_all)
-        elapsed_s = int(elapsed_total)
-        comp_mb = completed_bytes / (1024.0 * 1024.0)
-
-        # Header: [104s | 229.29 / 7184.48 MB]
-        print(f"[{elapsed_s}s | {comp_mb:.2f} / {total_mb:.2f} MB]")
-
-        # Per-worker lines (completed + in-progress)
-        for w in range(num_workers):
-            if worker_pending[w]:
-                # Show completed results for this worker
-                for item in worker_pending[w]:
-                    gpu_tag = f"[{item['gpu_id']}]"
-                    v_name = item["video_name"]
-                    pct = (item["video_global_idx"] / total_vids) * 100.0
-                    mb_size = item["file_size"] / (1024.0 * 1024.0)
-
+        el = max(1e-4, time.perf_counter() - t_start)
+        print(f"[{int(el)}s | {comp_bytes / (1024.0 * 1024.0):.2f} / {tot_mb:.2f} MB]")
+        for w in range(n_workers):
+            if pending[w]:
+                for item in pending[w]:
+                    tag, name = f"[{item['gpu_id']}]", item["video_name"]
+                    mb = item["file_size"] / (1024.0 * 1024.0)
+                    pct = (item["global_idx"] / len(v_files)) * 100.0
                     if item["status"] == "ok":
-                        print(
-                            f">  {gpu_tag} [{item['video_global_idx']:>{len(str(total_vids))}}/{total_vids} | {pct:>5.1f}%] "
-                            f"{v_name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb_size:.1f} MB"
-                        )
+                        print(f">  {tag} [{item['global_idx']:>{len(str(len(v_files)))}}/{len(v_files)} | {pct:>5.1f}%] {name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb:.1f} MB")
                     else:
-                        err_msg = str(item["error_msg"] or "Unknown error")
-                        errors.append((item["video_name"], err_msg))
-                        print(
-                            f">  {gpu_tag} [{item['video_global_idx']}/{total_vids} | FAIL] {v_name} | {err_msg}"
-                        )
-                worker_pending[w].clear()
-            elif w in active_worker_ids and w in worker_current_video:
-                # Worker still processing — show current video
-                gpu_tag = f"[{devices[w]}]"
-                print(f">  {gpu_tag} processing... {worker_current_video[w]}")
+                        msg = str(item["error_msg"] or "Unknown error")
+                        errs.append((name, msg))
+                        print(f">  {tag} [{item['global_idx']}/{len(v_files)} | FAIL] {name} | {msg}")
+                pending[w].clear()
+            elif w in active_w and w in cur_vid:
+                print(f">  [{devices[w]}] processing... {cur_vid[w]}")
 
-        # Footer: ETA from global throughput
-        remaining = total_vids - finished_videos
-        if remaining > 0 and finished_videos > 0:
-            avg_time = elapsed_total / finished_videos
-            eta_sec = int(remaining * avg_time / max(1, len(active_worker_ids)))
-            eta_str = f"{eta_sec // 60}m {eta_sec % 60:02d}s" if eta_sec >= 60 else f"{eta_sec}s"
-        else:
-            eta_str = "0s"
-
+        rem = len(v_files) - n_vids
+        eta_s = int(rem * (el / n_vids) / max(1, len(active_w))) if rem > 0 and n_vids > 0 else 0
+        eta_str = f"{eta_s // 60}m {eta_s % 60:02d}s" if eta_s >= 60 else f"{eta_s}s"
         print(f"[ETA: {eta_str}]\n", flush=True)
-        first_pending_time = None
+        t_first_pending = None
 
-    while active_workers > 0 or not result_queue.empty() or not progress_queue.empty():
+    while active_procs > 0 or not res_q.empty() or not prog_q.empty():
         try:
-            info = progress_queue.get(timeout=0.1)
-            w_id = info["worker_id"]
-
+            info = prog_q.get(timeout=0.1)
+            wid = info["worker_id"]
             if info["status"] == "started":
-                # Worker began processing a new video
-                worker_current_video[w_id] = info["video_name"]
+                cur_vid[wid] = info["video_name"]
                 continue
 
-            completed_bytes += info["file_size"]
-            finished_videos += 1
-            total_keyframes_count += info["num_keyframes"]
-            total_detections_count += info["num_detections"]
+            comp_bytes += info["file_size"]
+            n_vids += 1
+            tot_kfs += info["num_keyframes"]
+            tot_dets += info["num_detections"]
+            info["global_idx"] = n_vids
+            pending[wid].append(info)
+            cur_vid.pop(wid, None)
 
-            worker_finished_count[w_id] += 1
-            info["video_global_idx"] = finished_videos
-            worker_pending[w_id].append(info)
-            worker_current_video.pop(w_id, None)
-
-            if first_pending_time is None:
-                first_pending_time = time.perf_counter()
-
-            all_active_reported = bool(active_worker_ids) and all(
-                len(worker_pending[w]) > 0 for w in active_worker_ids
-            )
-            timed_out = (first_pending_time is not None) and (time.perf_counter() - first_pending_time > 10.0)
-
-            if all_active_reported or timed_out:
+            if t_first_pending is None:
+                t_first_pending = time.perf_counter()
+            if (active_w and all(pending[w] for w in active_w)) or (time.perf_counter() - t_first_pending > 10.0):
                 flush_block()
         except queue.Empty:
-            if first_pending_time is not None and (time.perf_counter() - first_pending_time > 10.0):
+            if t_first_pending is not None and (time.perf_counter() - t_first_pending > 10.0):
                 flush_block()
 
         try:
-            records = result_queue.get(timeout=0.1)
-            if isinstance(records, tuple) and records[0] == "SENTINEL":
-                sentinel_wid = records[1]
-                active_workers -= 1
-                dead_workers.add(sentinel_wid)
-                active_worker_ids.discard(sentinel_wid)
+            recs = res_q.get(timeout=0.1)
+            if isinstance(recs, tuple) and recs[0] == "SENTINEL":
+                wid = recs[1]
+                active_procs -= 1
+                dead_w.add(wid)
+                active_w.discard(wid)
             else:
-                all_records.extend(records)
-                # Incremental parquet save after every video
-                if all_records:
+                records.extend(recs)
+                if records:
                     try:
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        pl.DataFrame(all_records).write_parquet(output_path, compression="zstd")
-                        last_save_count = finished_videos
-                    except Exception as save_err:
-                        print(f"WARNING: Incremental save failed: {save_err}", file=sys.stderr, flush=True)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        pl.DataFrame(records).write_parquet(out_path, compression="zstd")
+                    except Exception as e:
+                        print(f"WARNING: Incremental save failed: {e}", file=sys.stderr, flush=True)
         except queue.Empty:
             pass
 
-        # Liveness check: detect individual crashed workers whose sentinel was lost
-        if active_workers > 0 and result_queue.empty() and progress_queue.empty():
-            for i, p in enumerate(processes):
-                if i not in dead_workers and not p.is_alive():
-                    dead_workers.add(i)
-                    active_workers -= 1
-                    active_worker_ids.discard(i)
-                    print(f"WARNING: Worker {i} ({devices[i]}) died unexpectedly (no sentinel). active_workers={active_workers}", file=sys.stderr, flush=True)
+        if active_procs > 0 and res_q.empty() and prog_q.empty():
+            for i, p in enumerate(procs):
+                if i not in dead_w and not p.is_alive():
+                    dead_w.add(i)
+                    active_procs -= 1
+                    active_w.discard(i)
+                    print(f"WARNING: Worker {i} ({devices[i]}) died unexpectedly.", file=sys.stderr, flush=True)
 
     flush_block()
-
-    for p in processes:
+    for p in procs:
         p.join()
 
-    print(f"Saving index of {len(all_records)} keyframes to '{output_path}'...", flush=True)
-    if all_records:
-        df = pl.DataFrame(all_records)
-    else:
-        df = pl.DataFrame(
-            schema={
-                "video_id": pl.Utf8,
-                "time": pl.Float64,
-                "frame_idx": pl.Int64,
-                "start_time": pl.Float64,
-                "end_time": pl.Float64,
-                "start_frame": pl.Int64,
-                "end_frame": pl.Int64,
-                "fps": pl.Float32,
-                "width": pl.Int32,
-                "height": pl.Int32,
-                "objects": pl.List(pl.Utf8),
-                "scores": pl.List(pl.Float32),
-                "boxes": pl.List(pl.List(pl.Float32)),
-                "labels": pl.List(pl.Utf8),
-                "txt": pl.Utf8,
-                "objects_str": pl.Utf8,
-                "colors": pl.List(pl.Utf8),
-                "is_monochrome": pl.Boolean,
-                "video_path": pl.Utf8,
-            }
-        )
+    df = pl.DataFrame(records) if records else pl.DataFrame(schema=SCHEMA)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(out_path, compression="zstd")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(output_path, compression="zstd")
-
-    # Finish Summary
-    total_elapsed = max(1e-3, time.perf_counter() - start_time_all)
-    overall_fps = round(total_keyframes_count / total_elapsed, 1)
-    out_size_mb = output_path.stat().st_size / (1024.0 * 1024.0) if output_path.exists() else 0.0
-
+    t_tot = max(1e-3, time.perf_counter() - t_start)
+    out_mb = out_path.stat().st_size / (1024.0 * 1024.0) if out_path.exists() else 0.0
     print("=== Indexing Complete ===")
-    print(f"Total Videos Processed  : {finished_videos} / {total_vids}")
-    print(f"Successful Videos       : {finished_videos - len(errors)}")
-    if errors:
-        print(f"Failed Videos           : {len(errors)}")
-    print(f"Total Keyframes Indexed : {total_keyframes_count:,}")
-    print(f"Total Objects Detected  : {total_detections_count:,}")
-    print(f"Total Processing Time   : {total_elapsed:.2f} s ({total_elapsed / 60:.1f} min)")
-    print(f"Overall Throughput      : {overall_fps} keyframes/sec")
-    print(f"Parquet Output Path     : {output_path}")
-    print(f"Parquet File Size       : {out_size_mb:.2f} MB ({out_size_mb * 1024:.1f} KB)")
+    print(f"Total Videos Processed  : {n_vids} / {len(v_files)}")
+    print(f"Successful Videos       : {n_vids - len(errs)}")
+    if errs:
+        print(f"Failed Videos           : {len(errs)}")
+    print(f"Total Keyframes Indexed : {tot_kfs:,}")
+    print(f"Total Objects Detected  : {tot_dets:,}")
+    print(f"Total Processing Time   : {t_tot:.2f} s ({t_tot / 60:.1f} min)")
+    print(f"Overall Throughput      : {round(tot_kfs / t_tot, 1)} keyframes/sec")
+    print(f"Parquet Output Path     : {out_path}")
+    print(f"Parquet File Size       : {out_mb:.2f} MB ({out_mb * 1024:.1f} KB)")
     print("=========================", flush=True)
 
 

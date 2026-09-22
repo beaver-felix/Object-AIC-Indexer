@@ -21,7 +21,7 @@ from pathlib import Path
 import queue
 import sys
 import time
-from typing import Any
+from typing import Any, Generator
 
 import cv2
 import numpy as np
@@ -119,59 +119,114 @@ def detect_scenes_and_keyframes(video_path: Path, max_scene_len_sec: float = 10.
     return shots
 
 
-def extract_shot_keyframes(video_path: Path, shots: list[dict[str, Any]]) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
-    """Read keyframes from video corresponding to detected shots."""
+def stream_shot_keyframes(
+    video_path: Path, shots: list[dict[str, Any]], batch_size: int = 16
+) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
+    """Yield batches of keyframes for detected shots to keep memory footprint bounded."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return [], 0.0, 0, 0
-    fps, w, h = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    results, cur = [], 0
-    for shot in sorted(shots, key=lambda s: s["middle_frame"]):
-        target = shot["middle_frame"]
-        if target - cur > 30:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            cur = target
-        while cur < target and cap.grab():
+        return
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cur = 0
+    batch_meta: list[dict[str, Any]] = []
+    batch_frames: list[np.ndarray] = []
+
+    try:
+        for shot in sorted(shots, key=lambda s: s["middle_frame"]):
+            target = shot["middle_frame"]
+            if target - cur > 30:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                cur = target
+            while cur < target and cap.grab():
+                cur += 1
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
             cur += 1
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            break
-        results.append((shot, frame))
-        cur += 1
-    cap.release()
+            batch_meta.append(shot)
+            batch_frames.append(frame)
+            if len(batch_frames) >= batch_size:
+                yield batch_meta, batch_frames, fps, w, h
+                batch_meta = []
+                batch_frames = []
+        if batch_frames:
+            yield batch_meta, batch_frames, fps, w, h
+    finally:
+        cap.release()
+
+
+def stream_strided_frames(
+    video_path: Path, stride: int = 10, batch_size: int = 16
+) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
+    """Yield batches of strided frames to keep memory footprint bounded."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    stride = max(1, int(stride))
+    idx = 0
+    batch_meta: list[dict[str, Any]] = []
+    batch_frames: list[np.ndarray] = []
+
+    try:
+        while True:
+            if idx % stride == 0:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+                ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                t = float(ms / 1000.0) if ms > 0 else float(idx / fps)
+                meta = {
+                    "start_frame": max(0, idx - stride // 2),
+                    "end_frame": idx + stride // 2,
+                    "start_time": round(max(0.0, (idx - stride // 2) / fps), 3),
+                    "end_time": round((idx + stride // 2) / fps, 3),
+                    "middle_frame": idx,
+                    "middle_time": round(t, 3),
+                }
+                batch_meta.append(meta)
+                batch_frames.append(frame)
+                if len(batch_frames) >= batch_size:
+                    yield batch_meta, batch_frames, fps, w, h
+                    batch_meta = []
+                    batch_frames = []
+            elif not cap.grab():
+                break
+            idx += 1
+        if batch_frames:
+            yield batch_meta, batch_frames, fps, w, h
+    finally:
+        cap.release()
+
+
+def extract_shot_keyframes(video_path: Path, shots: list[dict[str, Any]]) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
+    """Read keyframes from video corresponding to detected shots."""
+    results: list[tuple[dict[str, Any], np.ndarray]] = []
+    fps, w, h = 25.0, 0, 0
+    for b_meta, b_frames, fps, w, h in stream_shot_keyframes(video_path, shots, batch_size=64):
+        for m, f in zip(b_meta, b_frames):
+            results.append((m, f))
     return results, fps, w, h
 
 
 def extract_strided_frames(video_path: Path, stride: int = 10) -> tuple[list[tuple[dict[str, Any], np.ndarray]], float, int, int]:
     """Extract frames at fixed stride using fast cap.grab() frame skipping."""
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return [], 0.0, 0, 0
-    fps, w, h = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    stride = max(1, int(stride))
-    results, idx = [], 0
-    while True:
-        if idx % stride == 0:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                break
-            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            t = float(ms / 1000.0) if ms > 0 else float(idx / fps)
-            results.append(({
-                "start_frame": max(0, idx - stride // 2), "end_frame": idx + stride // 2,
-                "start_time": round(max(0.0, (idx - stride // 2) / fps), 3), "end_time": round((idx + stride // 2) / fps, 3),
-                "middle_frame": idx, "middle_time": round(t, 3),
-            }, frame))
-        elif not cap.grab():
-            break
-        idx += 1
-    cap.release()
+    results: list[tuple[dict[str, Any], np.ndarray]] = []
+    fps, w, h = 25.0, 0, 0
+    for b_meta, b_frames, fps, w, h in stream_strided_frames(video_path, stride=stride, batch_size=64):
+        for m, f in zip(b_meta, b_frames):
+            results.append((m, f))
     return results, fps, w, h
 
 
 def gpu_worker_process(
     worker_id: int, gpu_id: str, task_q: mp.Queue, res_q: mp.Queue, prog_q: mp.Queue,
     model_name: str, conf: float, batch_size: int, use_scenes: bool, stride: int, max_scene_len: float,
+    max_det: int = 300,
 ) -> None:
     """Worker process: pulls videos from queue, runs YOLO, pushes records."""
     try:
@@ -193,17 +248,19 @@ def gpu_worker_process(
                 if use_scenes:
                     try:
                         shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
-                        kfs, fps, w, h = extract_shot_keyframes(video_file, shots)
+                        batch_gen = stream_shot_keyframes(video_file, shots, batch_size=batch_size)
                     except Exception:
-                        kfs, fps, w, h = extract_strided_frames(video_file, stride=stride)
+                        batch_gen = stream_strided_frames(video_file, stride=stride, batch_size=batch_size)
                 else:
-                    kfs, fps, w, h = extract_strided_frames(video_file, stride=stride)
+                    batch_gen = stream_strided_frames(video_file, stride=stride, batch_size=batch_size)
 
-                records, n_det = [], 0
-                for b_start in range(0, len(kfs), batch_size):
-                    batch = kfs[b_start : b_start + batch_size]
-                    results = model.predict([item[1] for item in batch], conf=conf, device=gpu_id, verbose=False)
-                    for (meta, img), det in zip(batch, results):
+                records: list[dict[str, Any]] = []
+                n_det = 0
+                tot_kfs = 0
+                for batch_meta, batch_frames, fps, w, h in batch_gen:
+                    tot_kfs += len(batch_frames)
+                    results = model.predict(batch_frames, conf=conf, device=gpu_id, verbose=False, max_det=max_det, agnostic_nms=True)
+                    for meta, img, det in zip(batch_meta, batch_frames, results):
                         mono, colors = analyze_frame_colors(img)
                         b_lbls, b_scs, b_boxes = [], [], []
                         if det.boxes is not None and len(det.boxes) > 0:
@@ -225,7 +282,7 @@ def gpu_worker_process(
 
                 el = max(1e-4, time.perf_counter() - t0)
                 res_q.put(records)
-                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": len(kfs), "num_detections": n_det, "fps": round(len(kfs) / el, 1), "status": "ok", "error_msg": None})
+                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": tot_kfs, "num_detections": n_det, "fps": round(tot_kfs / el, 1), "status": "ok", "error_msg": None})
             except Exception as err:
                 el = max(1e-4, time.perf_counter() - t0)
                 res_q.put([])
@@ -234,6 +291,7 @@ def gpu_worker_process(
         prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": "<fatal>", "file_size": 0, "num_keyframes": 0, "num_detections": 0, "fps": 0.0, "status": "error", "error_msg": f"FATAL: {fatal}"})
     finally:
         res_q.put(("SENTINEL", worker_id))
+
 
 
 def collect_video_files(inputs: list[str], recursive_dirs: list[str] | None) -> list[Path]:
@@ -260,6 +318,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-scene-len", type=float, default=10.0, help="Max shot duration in seconds (default: 10.0).")
     p.add_argument("--model", default="yolo26x.pt", help="YOLO model path or name (default: yolo26x.pt).")
     p.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25).")
+    p.add_argument("--max-det", type=int, default=300, help="Max detections per frame for NMS (default: 300).")
     p.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
     p.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs (0 = auto-detect all available).")
     return p.parse_args()
@@ -294,8 +353,9 @@ def main() -> None:
     for f in v_files:
         task_q.put(f)
 
+    worker_args = lambda i: (i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det)
     procs = [
-        ctx.Process(target=gpu_worker_process, args=(i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len))
+        ctx.Process(target=gpu_worker_process, args=worker_args(i))
         for i in range(n_workers)
     ]
     for p in procs:
@@ -319,7 +379,7 @@ def main() -> None:
             return
 
         el = max(1e-4, time.perf_counter() - t_start)
-        print(f"[{int(el)}s | {comp_bytes / (1024.0 * 1024.0):.2f} / {tot_mb:.2f} MB]")
+        lines = [f"[{int(el)}s | {comp_bytes / (1024.0 * 1024.0):.2f} / {tot_mb:.2f} MB]"]
         for w in range(n_workers):
             if pending[w]:
                 for item in pending[w]:
@@ -327,19 +387,24 @@ def main() -> None:
                     mb = item["file_size"] / (1024.0 * 1024.0)
                     pct = (item["global_idx"] / len(v_files)) * 100.0
                     if item["status"] == "ok":
-                        print(f">  {tag} [{item['global_idx']:>{len(str(len(v_files)))}}/{len(v_files)} | {pct:>5.1f}%] {name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb:.1f} MB")
+                        lines.append(f">  {tag} [{item['global_idx']:>{len(str(len(v_files)))}}/{len(v_files)} | {pct:>5.1f}%] {name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb:.1f} MB")
                     else:
                         msg = str(item["error_msg"] or "Unknown error")
                         errs.append((name, msg))
-                        print(f">  {tag} [{item['global_idx']}/{len(v_files)} | FAIL] {name} | {msg}")
+                        lines.append(f">  {tag} [{item['global_idx']}/{len(v_files)} | FAIL] {name} | {msg}")
                 pending[w].clear()
             elif w in active_w and w in cur_vid:
-                print(f">  [{devices[w]}] processing... {cur_vid[w]}")
+                lines.append(f">  [{devices[w]}] processing... {cur_vid[w]}")
 
         rem = len(v_files) - n_vids
         eta_s = int(rem * (el / n_vids) / max(1, len(active_w))) if rem > 0 and n_vids > 0 else 0
         eta_str = f"{eta_s // 60}m {eta_s % 60:02d}s" if eta_s >= 60 else f"{eta_s}s"
-        print(f"[ETA: {eta_str}]\n", flush=True)
+        lines.append(f"[ETA: {eta_str}]\n")
+        try:
+            print("\n".join(lines))
+            sys.stdout.flush()
+        except Exception:
+            pass
         t_first_pending = None
 
     while active_procs > 0 or not res_q.empty() or not prog_q.empty():
@@ -390,7 +455,30 @@ def main() -> None:
                     dead_w.add(i)
                     active_procs -= 1
                     active_w.discard(i)
-                    print(f"WARNING: Worker {i} ({devices[i]}) died unexpectedly.", file=sys.stderr, flush=True)
+                    try:
+                        print(f"WARNING: Worker {i} ({devices[i]}) died unexpectedly.", file=sys.stderr)
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    # Re-queue the video that was being processed when worker died
+                    if i in cur_vid:
+                        lost_vid_name = cur_vid.pop(i)
+                        lost_path = next((f for f in v_files if f.name == lost_vid_name), None)
+                        if lost_path is not None:
+                            task_q.put(lost_path)
+                            print(f"  Re-queued {lost_vid_name} for retry.", file=sys.stderr, flush=True)
+                    # Spawn replacement worker on same GPU if tasks remain
+                    if not task_q.empty():
+                        new_id = len(procs)
+                        gpu = devices[i]
+                        new_p = ctx.Process(target=gpu_worker_process, args=(new_id, gpu, task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det))
+                        procs.append(new_p)
+                        devices.append(gpu)
+                        active_w.add(new_id)
+                        pending[new_id] = []
+                        new_p.start()
+                        active_procs += 1
+                        print(f"  Spawned replacement worker {new_id} on {gpu}.", file=sys.stderr, flush=True)
 
     flush_block()
     for p in procs:

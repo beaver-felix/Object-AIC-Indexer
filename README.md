@@ -45,6 +45,7 @@ uv run AIC_indexer.py -r /path/to/videos -o /kaggle/working/obj-idx.parquet --st
 | `--conf` | Option (`float`) | `0.25` | Object detection confidence threshold. |
 | `--batch-size` | Option (`int`) | `32` | Frame inference batch size per GPU. |
 | `--num-gpus` | Option (`int`) | `0` | Number of GPUs to use. `0` auto-detects all GPUs (e.g. 2 workers for Kaggle 2x T4). |
+| `--log-mode` | Option (`str`) | `auto` | Log output style: `auto` (auto-detects Kaggle/headless), `line` (clean single-line per video), or `rich` (interactive terminal bar). |
 
 ### Argument Resolution Rules:
 - **`AIC_indexer.py -r folder1 folder2`**: `-r` collects `['folder1', 'folder2']`, scans recursively for video extensions.
@@ -68,8 +69,7 @@ os.environ["PATH"] = f"/root/.local/bin:{os.environ['PATH']}"
 ```
 
 ### Step 3: Run Script
-Run in second code cell:
-```bash
+```
 !uv run AIC_indexer.py \
     -r /kaggle/input/your-video-dataset \
     -o obj-idx.parquet \
@@ -77,6 +77,16 @@ Run in second code cell:
     --batch-size 64 \
     --stride 10
 ```
+
+> **Log Output on Kaggle:**
+> AIC_indexer automatically detects the Kaggle notebook/batch execution environment and activates grouped multi-GPU line logging (avoiding messy ANSI progress bar spam):
+> ```text
+> [104s | 229.29 / 7184.48 MB]
+> >  [cuda:0] [ 1/50 |  2.0%] L01_V001.mp4 | 185 kf | 42.5 fps | 320 objs | 14.2 MB
+> >  [cuda:1] [ 2/50 |  4.0%] L01_V002.mp4 | 170 kf | 44.1 fps | 290 objs | 13.8 MB
+> [ETA: 12m 40s]
+> ```
+> *ETA is computed as the average of active GPU worker ETAs.* At completion, a formatted summary table shows total indexed keyframes, detected objects, throughput, and output file size.
 
 ### How Decisions are made:
 - **2x T4 GPUs (32 GB VRAM total)**:

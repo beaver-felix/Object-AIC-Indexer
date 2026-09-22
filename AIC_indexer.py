@@ -2,9 +2,8 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "polars",
-#     "duckdb",
 #     "pyarrow",
-#     "orjson",
+#     "numpy",
 #     "opencv-python-headless",
 #     "ultralytics",
 #     "scenedetect",
@@ -287,7 +286,7 @@ def extract_strided_frames(
 def gpu_worker_process(
     worker_id: int,
     gpu_id: str,
-    video_tasks: list[Path],
+    task_queue: mp.Queue,
     result_queue: mp.Queue,
     progress_queue: mp.Queue,
     model_name: str,
@@ -297,8 +296,7 @@ def gpu_worker_process(
     stride: int,
     max_scene_len: float,
 ) -> None:
-    """Worker process dedicated to 1 GPU (e.g. cuda:0 or cuda:1 on Kaggle 2x T4)."""
-    processed_videos: list[Path] = []
+    """Worker process dedicated to 1 GPU. Pulls videos from shared queue dynamically."""
     try:
         import logging
         logging.getLogger("ultralytics").setLevel(logging.WARNING)
@@ -310,12 +308,25 @@ def gpu_worker_process(
         device = gpu_id
         model = YOLO(model_name)
 
-        for video_file in video_tasks:
+        while True:
+            try:
+                video_file = task_queue.get_nowait()
+            except queue.Empty:
+                break
+
             t_vid_start = time.perf_counter()
             file_size = video_file.stat().st_size
             video_id = video_file.stem
             records: list[dict[str, Any]] = []
             total_detections = 0
+
+            # Notify main loop which video this worker started
+            progress_queue.put({
+                "worker_id": worker_id,
+                "gpu_id": gpu_id,
+                "video_name": video_file.name,
+                "status": "started",
+            })
 
             try:
                 # Extract frames: default 1 every N frames (default 10) or shot detection
@@ -406,7 +417,6 @@ def gpu_worker_process(
                     "status": "ok",
                     "error_msg": None,
                 })
-                processed_videos.append(video_file)
             except Exception as err:
                 elapsed_sec = max(1e-4, time.perf_counter() - t_vid_start)
                 result_queue.put([])
@@ -422,29 +432,23 @@ def gpu_worker_process(
                     "status": "error",
                     "error_msg": str(err),
                 })
-                processed_videos.append(video_file)
     except Exception as fatal_err:
         # Fatal: model failed to load, import error, or unexpected crash
-        # Report all remaining unprocessed videos as failed
-        remaining = [v for v in video_tasks if v not in processed_videos]
-        for video_file in remaining:
-            file_size = video_file.stat().st_size if video_file.exists() else 0
-            result_queue.put([])
-            progress_queue.put({
-                "worker_id": worker_id,
-                "gpu_id": gpu_id,
-                "video_name": video_file.name,
-                "file_size": file_size,
-                "num_keyframes": 0,
-                "num_detections": 0,
-                "elapsed_sec": 0.0,
-                "fps": 0.0,
-                "status": "error",
-                "error_msg": f"FATAL worker crash: {fatal_err}",
-            })
+        progress_queue.put({
+            "worker_id": worker_id,
+            "gpu_id": gpu_id,
+            "video_name": "<fatal>",
+            "file_size": 0,
+            "num_keyframes": 0,
+            "num_detections": 0,
+            "elapsed_sec": 0.0,
+            "fps": 0.0,
+            "status": "error",
+            "error_msg": f"FATAL worker crash: {fatal_err}",
+        })
     finally:
         # Always send sentinel so main loop never deadlocks
-        result_queue.put(None)
+        result_queue.put(("SENTINEL", worker_id))
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -457,7 +461,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=10, help="Sample 1 frame every N frames (default: 10).")
     parser.add_argument("--scene-detect", action="store_true", default=False, help="Use PySceneDetect shot keyframing instead of frame stride.")
     parser.add_argument("--max-scene-len", type=float, default=10.0, help="Max shot duration in seconds before partitioning (default: 10.0).")
-    parser.add_argument("--model", default="yolo26n.pt", help="YOLO model path or name (default: yolo26n.pt).")
+    parser.add_argument("--model", default="yolo26x.pt", help="YOLO model path or name (default: yolo26x.pt).")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25).")
     parser.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
     parser.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs to use (0 = auto-detect all available GPUs e.g. 2 on Kaggle).")
@@ -523,25 +527,23 @@ def main() -> None:
     print(f"Model & Batch    : {args.model} (conf={args.conf}, batch={args.batch_size})")
     print("=================================\n", flush=True)
 
-    # Partition video tasks round-robin across GPU workers
-    worker_tasks: list[list[Path]] = [[] for _ in range(num_workers)]
-    for idx, v_file in enumerate(video_files):
-        worker_tasks[idx % num_workers].append(v_file)
-
+    # Shared work queue — workers pull dynamically for perfect load balancing
     ctx = mp.get_context("spawn")
+    task_queue = ctx.Queue()
+    for v_file in video_files:
+        task_queue.put(v_file)
+
     result_queue = ctx.Queue()
     progress_queue = ctx.Queue()
 
     processes = []
     for w_id in range(num_workers):
-        if not worker_tasks[w_id]:
-            continue
         p = ctx.Process(
             target=gpu_worker_process,
             args=(
                 w_id,
                 devices[w_id],
-                worker_tasks[w_id],
+                task_queue,
                 result_queue,
                 progress_queue,
                 args.model,
@@ -564,12 +566,12 @@ def main() -> None:
     total_vids = len(video_files)
     active_workers = len(processes)
     start_time_all = time.perf_counter()
-    save_interval = max(1, min(10, total_vids // 5))  # Incremental save frequency
     last_save_count = 0
 
-    worker_total_tasks = [len(worker_tasks[w]) for w in range(num_workers)]
     worker_finished_count = [0 for _ in range(num_workers)]
-    active_worker_ids = {w for w in range(num_workers) if worker_total_tasks[w] > 0}
+    active_worker_ids = set(range(num_workers))
+    dead_workers: set[int] = set()
+    worker_current_video: dict[int, str] = {}  # track in-progress video per worker
 
     print("Starting indexing progression...\n", flush=True)
     worker_pending: dict[int, list[dict[str, Any]]] = {w: [] for w in range(num_workers)}
@@ -588,41 +590,38 @@ def main() -> None:
         # Header: [104s | 229.29 / 7184.48 MB]
         print(f"[{elapsed_s}s | {comp_mb:.2f} / {total_mb:.2f} MB]")
 
-        # Per-worker completed lines
+        # Per-worker lines (completed + in-progress)
         for w in range(num_workers):
-            for item in worker_pending[w]:
-                gpu_tag = f"[{item['gpu_id']}]"
-                v_name = item["video_name"]
-                pct = (item["video_global_idx"] / total_vids) * 100.0
-                mb_size = item["file_size"] / (1024.0 * 1024.0)
+            if worker_pending[w]:
+                # Show completed results for this worker
+                for item in worker_pending[w]:
+                    gpu_tag = f"[{item['gpu_id']}]"
+                    v_name = item["video_name"]
+                    pct = (item["video_global_idx"] / total_vids) * 100.0
+                    mb_size = item["file_size"] / (1024.0 * 1024.0)
 
-                if item["status"] == "ok":
-                    print(
-                        f">  {gpu_tag} [{item['video_global_idx']:>{len(str(total_vids))}}/{total_vids} | {pct:>5.1f}%] "
-                        f"{v_name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb_size:.1f} MB"
-                    )
-                else:
-                    err_msg = str(item["error_msg"] or "Unknown error")
-                    errors.append((item["video_name"], err_msg))
-                    print(
-                        f">  {gpu_tag} [{item['video_global_idx']}/{total_vids} | FAIL] {v_name} | {err_msg}"
-                    )
-            worker_pending[w].clear()
+                    if item["status"] == "ok":
+                        print(
+                            f">  {gpu_tag} [{item['video_global_idx']:>{len(str(total_vids))}}/{total_vids} | {pct:>5.1f}%] "
+                            f"{v_name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb_size:.1f} MB"
+                        )
+                    else:
+                        err_msg = str(item["error_msg"] or "Unknown error")
+                        errors.append((item["video_name"], err_msg))
+                        print(
+                            f">  {gpu_tag} [{item['video_global_idx']}/{total_vids} | FAIL] {v_name} | {err_msg}"
+                        )
+                worker_pending[w].clear()
+            elif w in active_worker_ids and w in worker_current_video:
+                # Worker still processing — show current video
+                gpu_tag = f"[{devices[w]}]"
+                print(f">  {gpu_tag} processing... {worker_current_video[w]}")
 
-        # Footer: [ETA: ..] averaged from worker ETAs
-        worker_etas: list[float] = []
-        for w in range(num_workers):
-            rem_w = worker_total_tasks[w] - worker_finished_count[w]
-            if rem_w > 0:
-                if worker_finished_count[w] > 0:
-                    avg_time_w = elapsed_total / worker_finished_count[w]
-                    worker_etas.append(rem_w * avg_time_w)
-                elif finished_videos > 0:
-                    avg_time_all = elapsed_total / finished_videos
-                    worker_etas.append(rem_w * avg_time_all)
-
-        if worker_etas:
-            eta_sec = int(sum(worker_etas) / len(worker_etas))
+        # Footer: ETA from global throughput
+        remaining = total_vids - finished_videos
+        if remaining > 0 and finished_videos > 0:
+            avg_time = elapsed_total / finished_videos
+            eta_sec = int(remaining * avg_time / max(1, len(active_worker_ids)))
             eta_str = f"{eta_sec // 60}m {eta_sec % 60:02d}s" if eta_sec >= 60 else f"{eta_sec}s"
         else:
             eta_str = "0s"
@@ -633,18 +632,22 @@ def main() -> None:
     while active_workers > 0 or not result_queue.empty() or not progress_queue.empty():
         try:
             info = progress_queue.get(timeout=0.1)
+            w_id = info["worker_id"]
+
+            if info["status"] == "started":
+                # Worker began processing a new video
+                worker_current_video[w_id] = info["video_name"]
+                continue
+
             completed_bytes += info["file_size"]
             finished_videos += 1
             total_keyframes_count += info["num_keyframes"]
             total_detections_count += info["num_detections"]
 
-            w_id = info["worker_id"]
             worker_finished_count[w_id] += 1
             info["video_global_idx"] = finished_videos
             worker_pending[w_id].append(info)
-
-            if worker_finished_count[w_id] >= worker_total_tasks[w_id]:
-                active_worker_ids.discard(w_id)
+            worker_current_video.pop(w_id, None)
 
             if first_pending_time is None:
                 first_pending_time = time.perf_counter()
@@ -662,12 +665,15 @@ def main() -> None:
 
         try:
             records = result_queue.get(timeout=0.1)
-            if records is None:
+            if isinstance(records, tuple) and records[0] == "SENTINEL":
+                sentinel_wid = records[1]
                 active_workers -= 1
+                dead_workers.add(sentinel_wid)
+                active_worker_ids.discard(sentinel_wid)
             else:
                 all_records.extend(records)
-                # Incremental parquet save to survive forced kills
-                if all_records and finished_videos - last_save_count >= save_interval:
+                # Incremental parquet save after every video
+                if all_records:
                     try:
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         pl.DataFrame(all_records).write_parquet(output_path, compression="zstd")
@@ -677,12 +683,14 @@ def main() -> None:
         except queue.Empty:
             pass
 
-        # Liveness check: detect crashed workers whose sentinel was lost
-        if active_workers > 0:
-            alive_count = sum(1 for p in processes if p.is_alive())
-            if alive_count == 0 and result_queue.empty() and progress_queue.empty():
-                print("WARNING: All worker processes died unexpectedly. Saving partial results.", file=sys.stderr, flush=True)
-                active_workers = 0
+        # Liveness check: detect individual crashed workers whose sentinel was lost
+        if active_workers > 0 and result_queue.empty() and progress_queue.empty():
+            for i, p in enumerate(processes):
+                if i not in dead_workers and not p.is_alive():
+                    dead_workers.add(i)
+                    active_workers -= 1
+                    active_worker_ids.discard(i)
+                    print(f"WARNING: Worker {i} ({devices[i]}) died unexpectedly (no sentinel). active_workers={active_workers}", file=sys.stderr, flush=True)
 
     flush_block()
 

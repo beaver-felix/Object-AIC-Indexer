@@ -41,10 +41,13 @@ uv run AIC_indexer.py -r /path/to/videos -o /kaggle/working/obj-idx.parquet --st
 | `--stride` | Option (`int`) | `10` | Frame stride. Only 1 frame every $N$ frames is decoded and passed to detector (`0, 10, 20, ...`). Intermediate frames skipped via fast `cap.grab()`. |
 | `--scene-detect` | Flag | `False` | Enables PySceneDetect adaptive shot detection. Extracts middle keyframe per shot. |
 | `--max-scene-len` | Option (`float`) | `10.0` | Maximum shot duration (seconds) before splitting into sub-shots (when `--scene-detect` active). |
-| `--model` | Option | `yolo26n.pt` | YOLO model name or checkpoint path. |
+| `--model` | Option | `yolo26x.pt` | YOLO model name or checkpoint path. |
 | `--conf` | Option (`float`) | `0.25` | Object detection confidence threshold. |
+| `--max-det` | Option (`int`) | `300` | Max detections per frame for NMS. |
 | `--batch-size` | Option (`int`) | `32` | Frame inference batch size per GPU. |
 | `--num-gpus` | Option (`int`) | `0` | Number of GPUs to use. `0` auto-detects all GPUs (e.g. 2 workers for Kaggle 2x T4). |
+| `--timeout` | Option (`float`) | `300.0` | Inactivity watchdog timeout in seconds without progress before declaring video hung. |
+| `--large-file-threshold` | Option (`float`) | `0.0` | GB threshold for adaptive stride (0 = disabled, strictly preserving stride for retrieval accuracy). |
 
 ### Argument Resolution Rules:
 - **`AIC_indexer.py -r folder1 folder2`**: `-r` collects `['folder1', 'folder2']`, scans recursively for video extensions.
@@ -78,14 +81,14 @@ os.environ["PATH"] = f"/root/.local/bin:{os.environ['PATH']}"
 ```
 
 > **Log Output on Kaggle:**
-> AIC_indexer automatically detects the Kaggle notebook/batch execution environment and activates grouped multi-GPU line logging (avoiding messy ANSI progress bar spam):
+> AIC_indexer automatically groups multi-GPU line logging and keeps ETA visible on every log write:
 > ```text
-> [104s | 229.29 / 7184.48 MB]
-> >  [cuda:0] [ 1/50 |  2.0%] L01_V001.mp4 | 185 kf | 42.5 fps | 320 objs | 14.2 MB
-> >  [cuda:1] [ 2/50 |  4.0%] L01_V002.mp4 | 170 kf | 44.1 fps | 290 objs | 13.8 MB
+> [104s | 229.29 / 7184.48 MB |   3.2% | ETA: 12m 40s]
+> >  [cuda:0] [ 1/50 |  2.0%] L01_V001.mp4 | 185 kf | 42.5 fps | 320 objs | 14.2 MB | ETA: 12m 40s
+> >  [cuda:1] processing... L01_V002.mp4 (120/450 kf |  26.7% | 44.1 fps | ETA: 7s)
 > [ETA: 12m 40s]
 > ```
-> *ETA is computed as the average of active GPU worker ETAs.* At completion, a formatted summary table shows total indexed keyframes, detected objects, throughput, and output file size.
+> *ETA is computed accurately across active GPU throughput and remaining bytes/videos.* At completion, a formatted summary table shows total indexed keyframes, detected objects, throughput, and output file size.
 
 ### How Decisions are made:
 - **2x T4 GPUs (32 GB VRAM total)**:

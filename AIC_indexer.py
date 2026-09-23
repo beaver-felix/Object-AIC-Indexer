@@ -19,7 +19,9 @@ import math
 import multiprocessing as mp
 from pathlib import Path
 import queue
+import subprocess
 import sys
+import threading
 import time
 from typing import Any, Generator
 
@@ -51,6 +53,87 @@ SCHEMA = {
     "labels": pl.List(pl.Utf8), "txt": pl.Utf8, "objects_str": pl.Utf8,
     "colors": pl.List(pl.Utf8), "is_monochrome": pl.Boolean, "video_path": pl.Utf8,
 }
+
+FLUSH_EVERY = 500  # flush records from worker every N to prevent OOM
+DEFAULT_TIMEOUT = 600  # per-video timeout in seconds
+DEFAULT_LARGE_FILE_GB = 10.0  # threshold for adaptive stride / skip scene detect
+
+
+def probe_video_ffprobe(video_path: Path) -> tuple[int, int, float, int]:
+    """Probe video metadata via ffprobe. Returns (width, height, fps, nb_frames)."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+             "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        parts = r.stdout.strip().split(",")
+        w, h = int(parts[0]), int(parts[1])
+        fps_parts = parts[2].split("/")
+        fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 and float(fps_parts[1]) > 0 else float(fps_parts[0])
+        nb = int(parts[3]) if parts[3].strip() != "N/A" else 0
+        return w, h, fps, nb
+    except Exception:
+        return 0, 0, 25.0, 0
+
+
+def stream_strided_frames_ffmpeg(
+    video_path: Path, stride: int = 10, batch_size: int = 16,
+) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
+    """Extract strided frames via ffmpeg raw pipe — handles AV1, VP9, etc."""
+    w, h, fps, _ = probe_video_ffprobe(video_path)
+    if w == 0 or h == 0:
+        return
+    stride = max(1, int(stride))
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_path),
+        "-vf", f"select=not(mod(n\\,{stride}))",
+        "-vsync", "vfr",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 3 * 4)
+    frame_bytes = w * h * 3
+    idx = 0  # source frame index (multiples of stride)
+    batch_meta: list[dict[str, Any]] = []
+    batch_frames: list[np.ndarray] = []
+
+    try:
+        while True:
+            raw = b""
+            while len(raw) < frame_bytes:
+                chunk = proc.stdout.read(frame_bytes - len(raw))  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                raw += chunk
+            if len(raw) < frame_bytes:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
+            src_idx = idx * stride
+            t = round(src_idx / fps, 3)
+            meta = {
+                "start_frame": max(0, src_idx - stride // 2),
+                "end_frame": src_idx + stride // 2,
+                "start_time": round(max(0.0, (src_idx - stride // 2) / fps), 3),
+                "end_time": round((src_idx + stride // 2) / fps, 3),
+                "middle_frame": src_idx,
+                "middle_time": t,
+            }
+            batch_meta.append(meta)
+            batch_frames.append(frame)
+            idx += 1
+            if len(batch_frames) >= batch_size:
+                yield batch_meta, batch_frames, fps, w, h
+                batch_meta = []
+                batch_frames = []
+        if batch_frames:
+            yield batch_meta, batch_frames, fps, w, h
+    finally:
+        proc.stdout.close()  # type: ignore[union-attr]
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 def encode_positional_boxes(boxes: list[list[float]], labels: list[str], n: int = 7, tol: float = 0.1) -> str:
@@ -158,17 +241,21 @@ def stream_shot_keyframes(
 
 
 def stream_strided_frames(
-    video_path: Path, stride: int = 10, batch_size: int = 16
+    video_path: Path, stride: int = 10, batch_size: int = 16,
+    ffmpeg_fallback: bool = True,
 ) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
-    """Yield batches of strided frames to keep memory footprint bounded."""
+    """Yield batches of strided frames. Auto-falls back to ffmpeg if OpenCV fails."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
+        if ffmpeg_fallback:
+            yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
         return
     fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     stride = max(1, int(stride))
     idx = 0
+    read_ok = False  # track if we ever successfully read a frame
     batch_meta: list[dict[str, Any]] = []
     batch_frames: list[np.ndarray] = []
 
@@ -177,7 +264,13 @@ def stream_strided_frames(
             if idx % stride == 0:
                 ret, frame = cap.read()
                 if not ret or frame is None:
+                    if not read_ok and idx == 0 and ffmpeg_fallback:
+                        # First read failed — codec issue, fallback to ffmpeg
+                        cap.release()
+                        yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
+                        return
                     break
+                read_ok = True
                 ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                 t = float(ms / 1000.0) if ms > 0 else float(idx / fps)
                 meta = {
@@ -195,6 +288,10 @@ def stream_strided_frames(
                     batch_meta = []
                     batch_frames = []
             elif not cap.grab():
+                if not read_ok and ffmpeg_fallback:
+                    cap.release()
+                    yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
+                    return
                 break
             idx += 1
         if batch_frames:
@@ -223,10 +320,78 @@ def extract_strided_frames(video_path: Path, stride: int = 10) -> tuple[list[tup
     return results, fps, w, h
 
 
+def _process_single_video(
+    video_file: Path, model: Any, gpu_id: str, conf: float, batch_size: int,
+    use_scenes: bool, stride: int, max_scene_len: float, max_det: int,
+    large_threshold_gb: float, ffmpeg_fallback: bool,
+    res_q: mp.Queue, prog_q: mp.Queue, worker_id: int,
+) -> tuple[int, int, float]:
+    """Process one video — called from worker, may run inside timeout thread."""
+    fsize = video_file.stat().st_size
+    file_gb = fsize / (1024 ** 3)
+    vid = video_file.stem
+    t0 = time.perf_counter()
+
+    # Adaptive stride for large files
+    effective_stride = stride
+    force_strided = False
+    if file_gb > large_threshold_gb:
+        scale = max(1, int(file_gb / large_threshold_gb))
+        effective_stride = stride * scale
+        force_strided = True  # skip scene detect for huge files
+
+    if use_scenes and not force_strided:
+        try:
+            shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
+            batch_gen = stream_shot_keyframes(video_file, shots, batch_size=batch_size)
+        except Exception:
+            batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size, ffmpeg_fallback=ffmpeg_fallback)
+    else:
+        batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size, ffmpeg_fallback=ffmpeg_fallback)
+
+    records: list[dict[str, Any]] = []
+    n_det = 0
+    tot_kfs = 0
+    for batch_meta, batch_frames, fps, w, h in batch_gen:
+        tot_kfs += len(batch_frames)
+        results = model.predict(batch_frames, conf=conf, device=gpu_id, verbose=False, max_det=max_det, agnostic_nms=True)
+        for meta, img, det in zip(batch_meta, batch_frames, results):
+            mono, colors = analyze_frame_colors(img)
+            b_lbls, b_scs, b_boxes = [], [], []
+            if det.boxes is not None and len(det.boxes) > 0:
+                ih, iw = img.shape[:2]
+                for c_val, cl_id, box in zip(det.boxes.conf.cpu().numpy(), det.boxes.cls.cpu().numpy().astype(int), det.boxes.xyxy.cpu().numpy()):
+                    b_lbls.append(str(det.names.get(cl_id, f"obj_{cl_id}")))
+                    b_scs.append(float(c_val))
+                    b_boxes.append([float(box[1] / ih), float(box[0] / iw), float(box[3] / ih), float(box[2] / iw)])
+            n_det += len(b_lbls)
+            records.append({
+                "video_id": vid, "time": float(meta["middle_time"]), "frame_idx": int(meta["middle_frame"]),
+                "start_time": float(meta["start_time"]), "end_time": float(meta["end_time"]),
+                "start_frame": int(meta["start_frame"]), "end_frame": int(meta["end_frame"]),
+                "fps": float(round(fps, 2)), "width": int(w), "height": int(h),
+                "objects": sorted(list(set(b_lbls))), "scores": b_scs, "boxes": b_boxes, "labels": b_lbls,
+                "txt": encode_positional_boxes(b_boxes, b_lbls), "objects_str": encode_object_counts(b_lbls, b_scs),
+                "colors": colors, "is_monochrome": mono, "video_path": str(video_file),
+            })
+            # Chunked flush to prevent OOM on massive videos
+            if len(records) >= FLUSH_EVERY:
+                res_q.put(records)
+                records = []
+
+    # Flush remaining
+    if records:
+        res_q.put(records)
+
+    el = max(1e-4, time.perf_counter() - t0)
+    return tot_kfs, n_det, el
+
+
 def gpu_worker_process(
     worker_id: int, gpu_id: str, task_q: mp.Queue, res_q: mp.Queue, prog_q: mp.Queue,
     model_name: str, conf: float, batch_size: int, use_scenes: bool, stride: int, max_scene_len: float,
-    max_det: int = 300,
+    max_det: int = 300, timeout: float = DEFAULT_TIMEOUT,
+    large_threshold_gb: float = DEFAULT_LARGE_FILE_GB, ffmpeg_fallback: bool = True,
 ) -> None:
     """Worker process: pulls videos from queue, runs YOLO, pushes records."""
     try:
@@ -242,51 +407,56 @@ def gpu_worker_process(
             except queue.Empty:
                 break
 
-            t0, fsize, vid = time.perf_counter(), video_file.stat().st_size, video_file.stem
+            fsize = video_file.stat().st_size
             prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "status": "started"})
-            try:
-                if use_scenes:
-                    try:
-                        shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
-                        batch_gen = stream_shot_keyframes(video_file, shots, batch_size=batch_size)
-                    except Exception:
-                        batch_gen = stream_strided_frames(video_file, stride=stride, batch_size=batch_size)
-                else:
-                    batch_gen = stream_strided_frames(video_file, stride=stride, batch_size=batch_size)
 
-                records: list[dict[str, Any]] = []
-                n_det = 0
-                tot_kfs = 0
-                for batch_meta, batch_frames, fps, w, h in batch_gen:
-                    tot_kfs += len(batch_frames)
-                    results = model.predict(batch_frames, conf=conf, device=gpu_id, verbose=False, max_det=max_det, agnostic_nms=True)
-                    for meta, img, det in zip(batch_meta, batch_frames, results):
-                        mono, colors = analyze_frame_colors(img)
-                        b_lbls, b_scs, b_boxes = [], [], []
-                        if det.boxes is not None and len(det.boxes) > 0:
-                            ih, iw = img.shape[:2]
-                            for c_val, cl_id, box in zip(det.boxes.conf.cpu().numpy(), det.boxes.cls.cpu().numpy().astype(int), det.boxes.xyxy.cpu().numpy()):
-                                b_lbls.append(str(det.names.get(cl_id, f"obj_{cl_id}")))
-                                b_scs.append(float(c_val))
-                                b_boxes.append([float(box[1] / ih), float(box[0] / iw), float(box[3] / ih), float(box[2] / iw)])
-                        n_det += len(b_lbls)
-                        records.append({
-                            "video_id": vid, "time": float(meta["middle_time"]), "frame_idx": int(meta["middle_frame"]),
-                            "start_time": float(meta["start_time"]), "end_time": float(meta["end_time"]),
-                            "start_frame": int(meta["start_frame"]), "end_frame": int(meta["end_frame"]),
-                            "fps": float(round(fps, 2)), "width": int(w), "height": int(h),
-                            "objects": sorted(list(set(b_lbls))), "scores": b_scs, "boxes": b_boxes, "labels": b_lbls,
-                            "txt": encode_positional_boxes(b_boxes, b_lbls), "objects_str": encode_object_counts(b_lbls, b_scs),
-                            "colors": colors, "is_monochrome": mono, "video_path": str(video_file),
-                        })
+            # Run with per-video timeout via thread
+            result_holder: list[Any] = [None]  # [(tot_kfs, n_det, elapsed)] or exception
 
-                el = max(1e-4, time.perf_counter() - t0)
-                res_q.put(records)
-                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": tot_kfs, "num_detections": n_det, "fps": round(tot_kfs / el, 1), "status": "ok", "error_msg": None})
-            except Exception as err:
-                el = max(1e-4, time.perf_counter() - t0)
-                res_q.put([])
-                prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name, "file_size": fsize, "num_keyframes": 0, "num_detections": 0, "fps": 0.0, "status": "error", "error_msg": str(err)})
+            def _target() -> None:
+                try:
+                    result_holder[0] = _process_single_video(
+                        video_file, model, gpu_id, conf, batch_size,
+                        use_scenes, stride, max_scene_len, max_det,
+                        large_threshold_gb, ffmpeg_fallback,
+                        res_q, prog_q, worker_id,
+                    )
+                except Exception as e:
+                    result_holder[0] = e
+
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+
+            if t.is_alive():
+                # Timeout — report and move on (thread is daemon, will die with process)
+                prog_q.put({
+                    "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
+                    "file_size": fsize, "num_keyframes": 0, "num_detections": 0,
+                    "fps": 0.0, "status": "timeout",
+                    "error_msg": f"Timed out after {timeout}s",
+                })
+            elif isinstance(result_holder[0], Exception):
+                prog_q.put({
+                    "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
+                    "file_size": fsize, "num_keyframes": 0, "num_detections": 0,
+                    "fps": 0.0, "status": "error",
+                    "error_msg": str(result_holder[0]),
+                })
+            elif result_holder[0] is not None:
+                tot_kfs, n_det, el = result_holder[0]
+                prog_q.put({
+                    "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
+                    "file_size": fsize, "num_keyframes": tot_kfs, "num_detections": n_det,
+                    "fps": round(tot_kfs / el, 1), "status": "ok", "error_msg": None,
+                })
+            else:
+                prog_q.put({
+                    "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
+                    "file_size": fsize, "num_keyframes": 0, "num_detections": 0,
+                    "fps": 0.0, "status": "error",
+                    "error_msg": "Unknown failure (no result)",
+                })
     except Exception as fatal:
         prog_q.put({"worker_id": worker_id, "gpu_id": gpu_id, "video_name": "<fatal>", "file_size": 0, "num_keyframes": 0, "num_detections": 0, "fps": 0.0, "status": "error", "error_msg": f"FATAL: {fatal}"})
     finally:
@@ -321,6 +491,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-det", type=int, default=300, help="Max detections per frame for NMS (default: 300).")
     p.add_argument("--batch-size", type=int, default=32, help="Inference batch size (default: 32).")
     p.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs (0 = auto-detect all available).")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"Per-video timeout in seconds (default: {DEFAULT_TIMEOUT}).")
+    p.add_argument("--large-file-threshold", type=float, default=DEFAULT_LARGE_FILE_GB, help=f"GB threshold for adaptive stride / skip scene detect (default: {DEFAULT_LARGE_FILE_GB}).")
+    p.add_argument("--no-ffmpeg-fallback", action="store_true", default=False, help="Disable ffmpeg pipe fallback for failed OpenCV decode.")
     return p.parse_args()
 
 
@@ -346,6 +519,8 @@ def main() -> None:
     print(f"Pipeline Mode    : {'PySceneDetect' if args.scene_detect else f'1 frame / {args.stride} frames'}")
     print(f"Hardware Workers : {n_workers} worker(s) ({', '.join(devices)})")
     print(f"Model & Batch    : {args.model} (conf={args.conf}, batch={args.batch_size})")
+    print(f"Per-Video Timeout: {args.timeout}s | Large File: >{args.large_file_threshold} GB")
+    print(f"FFmpeg Fallback  : {'enabled' if not args.no_ffmpeg_fallback else 'disabled'}")
     print("=================================\n", flush=True)
 
     ctx = mp.get_context("spawn")
@@ -353,7 +528,7 @@ def main() -> None:
     for f in v_files:
         task_q.put(f)
 
-    worker_args = lambda i: (i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det)
+    worker_args = lambda i: (i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold, not args.no_ffmpeg_fallback)
     procs = [
         ctx.Process(target=gpu_worker_process, args=worker_args(i))
         for i in range(n_workers)
@@ -388,6 +563,10 @@ def main() -> None:
                     pct = (item["global_idx"] / len(v_files)) * 100.0
                     if item["status"] == "ok":
                         lines.append(f">  {tag} [{item['global_idx']:>{len(str(len(v_files)))}}/{len(v_files)} | {pct:>5.1f}%] {name} | {item['num_keyframes']} kf | {item['fps']} fps | {item['num_detections']} objs | {mb:.1f} MB")
+                    elif item["status"] == "timeout":
+                        msg = str(item["error_msg"] or "Timed out")
+                        errs.append((name, msg))
+                        lines.append(f">  {tag} [{item['global_idx']}/{len(v_files)} | TIMEOUT] {name} | {msg}")
                     else:
                         msg = str(item["error_msg"] or "Unknown error")
                         errs.append((name, msg))
@@ -471,7 +650,7 @@ def main() -> None:
                     if not task_q.empty():
                         new_id = len(procs)
                         gpu = devices[i]
-                        new_p = ctx.Process(target=gpu_worker_process, args=(new_id, gpu, task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det))
+                        new_p = ctx.Process(target=gpu_worker_process, args=(new_id, gpu, task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold, not args.no_ffmpeg_fallback))
                         procs.append(new_p)
                         devices.append(gpu)
                         active_w.add(new_id)

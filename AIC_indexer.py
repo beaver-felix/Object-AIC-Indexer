@@ -58,31 +58,41 @@ FLUSH_EVERY = 500  # flush records from worker every N to prevent OOM
 DEFAULT_TIMEOUT = 600  # per-video timeout in seconds
 DEFAULT_LARGE_FILE_GB = 10.0  # threshold for adaptive stride / skip scene detect
 
+# Codecs that OpenCV can't HW-decode on most platforms — route straight to ffmpeg
+FFMPEG_ONLY_CODECS = {"av1", "vp9", "vp8", "av1_cuvid", "libdav1d"}
 
-def probe_video_ffprobe(video_path: Path) -> tuple[int, int, float, int]:
-    """Probe video metadata via ffprobe. Returns (width, height, fps, nb_frames)."""
+
+def probe_video_ffprobe(video_path: Path) -> tuple[int, int, float, int, str]:
+    """Probe video metadata via ffprobe. Returns (width, height, fps, nb_frames, codec_name)."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames,codec_name",
              "-of", "csv=p=0", str(video_path)],
             capture_output=True, text=True, timeout=30,
         )
         parts = r.stdout.strip().split(",")
-        w, h = int(parts[0]), int(parts[1])
-        fps_parts = parts[2].split("/")
+        codec = parts[0].strip().lower()
+        w, h = int(parts[1]), int(parts[2])
+        fps_parts = parts[3].split("/")
         fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 and float(fps_parts[1]) > 0 else float(fps_parts[0])
-        nb = int(parts[3]) if parts[3].strip() != "N/A" else 0
-        return w, h, fps, nb
+        nb = int(parts[4]) if parts[4].strip() != "N/A" else 0
+        return w, h, fps, nb, codec
     except Exception:
-        return 0, 0, 25.0, 0
+        return 0, 0, 25.0, 0, "unknown"
+
+
+def needs_ffmpeg_decode(video_path: Path) -> tuple[bool, str, int, int, float]:
+    """Check if video requires ffmpeg decode path. Returns (use_ffmpeg, codec, w, h, fps)."""
+    w, h, fps, _, codec = probe_video_ffprobe(video_path)
+    return codec in FFMPEG_ONLY_CODECS, codec, w, h, fps
 
 
 def stream_strided_frames_ffmpeg(
     video_path: Path, stride: int = 10, batch_size: int = 16,
 ) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
     """Extract strided frames via ffmpeg raw pipe — handles AV1, VP9, etc."""
-    w, h, fps, _ = probe_video_ffprobe(video_path)
+    w, h, fps, _, _codec = probe_video_ffprobe(video_path)
     if w == 0 or h == 0:
         return
     stride = max(1, int(stride))
@@ -242,20 +252,16 @@ def stream_shot_keyframes(
 
 def stream_strided_frames(
     video_path: Path, stride: int = 10, batch_size: int = 16,
-    ffmpeg_fallback: bool = True,
 ) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
-    """Yield batches of strided frames. Auto-falls back to ffmpeg if OpenCV fails."""
+    """Yield batches of strided frames via OpenCV. For unsupported codecs, use stream_strided_frames_ffmpeg directly."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        if ffmpeg_fallback:
-            yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
         return
     fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     stride = max(1, int(stride))
     idx = 0
-    read_ok = False  # track if we ever successfully read a frame
     batch_meta: list[dict[str, Any]] = []
     batch_frames: list[np.ndarray] = []
 
@@ -264,13 +270,7 @@ def stream_strided_frames(
             if idx % stride == 0:
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    if not read_ok and idx == 0 and ffmpeg_fallback:
-                        # First read failed — codec issue, fallback to ffmpeg
-                        cap.release()
-                        yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
-                        return
                     break
-                read_ok = True
                 ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                 t = float(ms / 1000.0) if ms > 0 else float(idx / fps)
                 meta = {
@@ -288,10 +288,6 @@ def stream_strided_frames(
                     batch_meta = []
                     batch_frames = []
             elif not cap.grab():
-                if not read_ok and ffmpeg_fallback:
-                    cap.release()
-                    yield from stream_strided_frames_ffmpeg(video_path, stride=stride, batch_size=batch_size)
-                    return
                 break
             idx += 1
         if batch_frames:
@@ -323,7 +319,7 @@ def extract_strided_frames(video_path: Path, stride: int = 10) -> tuple[list[tup
 def _process_single_video(
     video_file: Path, model: Any, gpu_id: str, conf: float, batch_size: int,
     use_scenes: bool, stride: int, max_scene_len: float, max_det: int,
-    large_threshold_gb: float, ffmpeg_fallback: bool,
+    large_threshold_gb: float,
     res_q: mp.Queue, prog_q: mp.Queue, worker_id: int,
 ) -> tuple[int, int, float]:
     """Process one video — called from worker, may run inside timeout thread."""
@@ -331,6 +327,9 @@ def _process_single_video(
     file_gb = fsize / (1024 ** 3)
     vid = video_file.stem
     t0 = time.perf_counter()
+
+    # Probe codec upfront — route AV1/VP9 directly to ffmpeg, skip OpenCV entirely
+    use_ffmpeg, codec, _, _, _ = needs_ffmpeg_decode(video_file)
 
     # Adaptive stride for large files
     effective_stride = stride
@@ -340,14 +339,17 @@ def _process_single_video(
         effective_stride = stride * scale
         force_strided = True  # skip scene detect for huge files
 
-    if use_scenes and not force_strided:
+    if use_ffmpeg:
+        # Codec unsupported by OpenCV — go straight to ffmpeg pipe
+        batch_gen = stream_strided_frames_ffmpeg(video_file, stride=effective_stride, batch_size=batch_size)
+    elif use_scenes and not force_strided:
         try:
             shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
             batch_gen = stream_shot_keyframes(video_file, shots, batch_size=batch_size)
         except Exception:
-            batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size, ffmpeg_fallback=ffmpeg_fallback)
+            batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size)
     else:
-        batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size, ffmpeg_fallback=ffmpeg_fallback)
+        batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size)
 
     records: list[dict[str, Any]] = []
     n_det = 0
@@ -391,7 +393,7 @@ def gpu_worker_process(
     worker_id: int, gpu_id: str, task_q: mp.Queue, res_q: mp.Queue, prog_q: mp.Queue,
     model_name: str, conf: float, batch_size: int, use_scenes: bool, stride: int, max_scene_len: float,
     max_det: int = 300, timeout: float = DEFAULT_TIMEOUT,
-    large_threshold_gb: float = DEFAULT_LARGE_FILE_GB, ffmpeg_fallback: bool = True,
+    large_threshold_gb: float = DEFAULT_LARGE_FILE_GB,
 ) -> None:
     """Worker process: pulls videos from queue, runs YOLO, pushes records."""
     try:
@@ -418,7 +420,7 @@ def gpu_worker_process(
                     result_holder[0] = _process_single_video(
                         video_file, model, gpu_id, conf, batch_size,
                         use_scenes, stride, max_scene_len, max_det,
-                        large_threshold_gb, ffmpeg_fallback,
+                        large_threshold_gb,
                         res_q, prog_q, worker_id,
                     )
                 except Exception as e:
@@ -493,7 +495,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-gpus", type=int, default=0, help="Number of GPUs (0 = auto-detect all available).")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"Per-video timeout in seconds (default: {DEFAULT_TIMEOUT}).")
     p.add_argument("--large-file-threshold", type=float, default=DEFAULT_LARGE_FILE_GB, help=f"GB threshold for adaptive stride / skip scene detect (default: {DEFAULT_LARGE_FILE_GB}).")
-    p.add_argument("--no-ffmpeg-fallback", action="store_true", default=False, help="Disable ffmpeg pipe fallback for failed OpenCV decode.")
+
     return p.parse_args()
 
 
@@ -520,7 +522,7 @@ def main() -> None:
     print(f"Hardware Workers : {n_workers} worker(s) ({', '.join(devices)})")
     print(f"Model & Batch    : {args.model} (conf={args.conf}, batch={args.batch_size})")
     print(f"Per-Video Timeout: {args.timeout}s | Large File: >{args.large_file_threshold} GB")
-    print(f"FFmpeg Fallback  : {'enabled' if not args.no_ffmpeg_fallback else 'disabled'}")
+    print(f"Codec Routing    : AV1/VP9 → ffmpeg pipe, others → OpenCV")
     print("=================================\n", flush=True)
 
     ctx = mp.get_context("spawn")
@@ -528,7 +530,7 @@ def main() -> None:
     for f in v_files:
         task_q.put(f)
 
-    worker_args = lambda i: (i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold, not args.no_ffmpeg_fallback)
+    worker_args = lambda i: (i, devices[i], task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold)
     procs = [
         ctx.Process(target=gpu_worker_process, args=worker_args(i))
         for i in range(n_workers)
@@ -650,7 +652,7 @@ def main() -> None:
                     if not task_q.empty():
                         new_id = len(procs)
                         gpu = devices[i]
-                        new_p = ctx.Process(target=gpu_worker_process, args=(new_id, gpu, task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold, not args.no_ffmpeg_fallback))
+                        new_p = ctx.Process(target=gpu_worker_process, args=(new_id, gpu, task_q, res_q, prog_q, args.model, args.conf, args.batch_size, args.scene_detect, args.stride, args.max_scene_len, args.max_det, args.timeout, args.large_file_threshold))
                         procs.append(new_p)
                         devices.append(gpu)
                         active_w.add(new_id)

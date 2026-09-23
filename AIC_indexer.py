@@ -7,6 +7,7 @@
 #     "opencv-python-headless",
 #     "ultralytics",
 #     "scenedetect",
+#     "orjson",
 # ]
 # ///
 """AIC_indexer.py: Multi-GPU Video Indexer for VISIONE obj-idx Parquet."""
@@ -17,6 +18,7 @@ import argparse
 from collections import Counter
 import math
 import multiprocessing as mp
+import orjson
 from pathlib import Path
 import queue
 import subprocess
@@ -55,7 +57,7 @@ SCHEMA = {
 }
 
 FLUSH_EVERY = 500  # flush records from worker every N to prevent OOM
-DEFAULT_TIMEOUT = 600  # per-video timeout in seconds
+DEFAULT_TIMEOUT = 1800  # per-video timeout in seconds (default 30m for multi-GB videos)
 DEFAULT_LARGE_FILE_GB = 10.0  # threshold for adaptive stride / skip scene detect
 
 # Codecs that OpenCV can't HW-decode on most platforms — route straight to ffmpeg
@@ -63,20 +65,32 @@ FFMPEG_ONLY_CODECS = {"av1", "vp9", "vp8", "av1_cuvid", "libdav1d"}
 
 
 def probe_video_ffprobe(video_path: Path) -> tuple[int, int, float, int, str]:
-    """Probe video metadata via ffprobe. Returns (width, height, fps, nb_frames, codec_name)."""
+    """Probe video metadata via ffprobe JSON. Returns (width, height, fps, nb_frames, codec_name)."""
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate,nb_frames,codec_name",
-             "-of", "csv=p=0", str(video_path)],
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,width,height,r_frame_rate,nb_frames",
+                "-of", "json", str(video_path)
+            ],
             capture_output=True, text=True, timeout=30,
         )
-        parts = r.stdout.strip().split(",")
-        codec = parts[0].strip().lower()
-        w, h = int(parts[1]), int(parts[2])
-        fps_parts = parts[3].split("/")
-        fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 and float(fps_parts[1]) > 0 else float(fps_parts[0])
-        nb = int(parts[4]) if parts[4].strip() != "N/A" else 0
+        data = orjson.loads(r.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            return 0, 0, 25.0, 0, "unknown"
+        s = streams[0]
+        codec = str(s.get("codec_name", "unknown")).lower()
+        w = int(s.get("width", 0))
+        h = int(s.get("height", 0))
+        fps_str = str(s.get("r_frame_rate", "25/1"))
+        if "/" in fps_str:
+            fps_parts = fps_str.split("/")
+            fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 and float(fps_parts[1]) > 0 else float(fps_parts[0])
+        else:
+            fps = float(fps_str)
+        nb_str = str(s.get("nb_frames", "0"))
+        nb = int(nb_str) if nb_str.isdigit() else 0
         return w, h, fps, nb, codec
     except Exception:
         return 0, 0, 25.0, 0, "unknown"
@@ -85,19 +99,23 @@ def probe_video_ffprobe(video_path: Path) -> tuple[int, int, float, int, str]:
 def needs_ffmpeg_decode(video_path: Path) -> tuple[bool, str, int, int, float]:
     """Check if video requires ffmpeg decode path. Returns (use_ffmpeg, codec, w, h, fps)."""
     w, h, fps, _, codec = probe_video_ffprobe(video_path)
-    return codec in FFMPEG_ONLY_CODECS, codec, w, h, fps
+    is_problematic = any(c in codec for c in FFMPEG_ONLY_CODECS)
+    return is_problematic, codec, w, h, fps
 
 
 def stream_strided_frames_ffmpeg(
     video_path: Path, stride: int = 10, batch_size: int = 16,
+    w: int = 0, h: int = 0, fps: float = 25.0,
 ) -> Generator[tuple[list[dict[str, Any]], list[np.ndarray], float, int, int], None, None]:
     """Extract strided frames via ffmpeg raw pipe — handles AV1, VP9, etc."""
-    w, h, fps, _, _codec = probe_video_ffprobe(video_path)
-    if w == 0 or h == 0:
+    if w <= 0 or h <= 0:
+        w, h, fps, _, _ = probe_video_ffprobe(video_path)
+    if w <= 0 or h <= 0:
         return
     stride = max(1, int(stride))
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-threads", "0",
         "-i", str(video_path),
         "-vf", f"select=not(mod(n\\,{stride}))",
         "-vsync", "vfr",
@@ -141,9 +159,17 @@ def stream_strided_frames_ffmpeg(
         if batch_frames:
             yield batch_meta, batch_frames, fps, w, h
     finally:
-        proc.stdout.close()  # type: ignore[union-attr]
-        proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
 
 
 def encode_positional_boxes(boxes: list[list[float]], labels: list[str], n: int = 7, tol: float = 0.1) -> str:
@@ -329,7 +355,7 @@ def _process_single_video(
     t0 = time.perf_counter()
 
     # Probe codec upfront — route AV1/VP9 directly to ffmpeg, skip OpenCV entirely
-    use_ffmpeg, codec, _, _, _ = needs_ffmpeg_decode(video_file)
+    use_ffmpeg, codec, w, h, fps = needs_ffmpeg_decode(video_file)
 
     # Adaptive stride for large files
     effective_stride = stride
@@ -339,14 +365,20 @@ def _process_single_video(
         effective_stride = stride * scale
         force_strided = True  # skip scene detect for huge files
 
+    engine = "ffmpeg pipe" if use_ffmpeg else ("PySceneDetect" if (use_scenes and not force_strided) else f"cv2 stride={effective_stride}")
+    print(f">  [{gpu_id}] [{video_file.name}] Start | Size: {file_gb:.2f} GB | Codec: {codec} | Res: {w}x{h}@{fps:.1f}fps | Engine: {engine}", flush=True)
+
     if use_ffmpeg:
         # Codec unsupported by OpenCV — go straight to ffmpeg pipe
-        batch_gen = stream_strided_frames_ffmpeg(video_file, stride=effective_stride, batch_size=batch_size)
+        batch_gen = stream_strided_frames_ffmpeg(video_file, stride=effective_stride, batch_size=batch_size, w=w, h=h, fps=fps)
     elif use_scenes and not force_strided:
         try:
+            print(f">  [{gpu_id}] [{video_file.name}] Detecting scenes via PySceneDetect...", flush=True)
             shots = detect_scenes_and_keyframes(video_file, max_scene_len_sec=max_scene_len)
+            print(f">  [{gpu_id}] [{video_file.name}] Detected {len(shots)} scenes. Extracting keyframes...", flush=True)
             batch_gen = stream_shot_keyframes(video_file, shots, batch_size=batch_size)
-        except Exception:
+        except Exception as e:
+            print(f">  [{gpu_id}] [{video_file.name}] Scene detect failed ({e}), falling back to strided...", flush=True)
             batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size)
     else:
         batch_gen = stream_strided_frames(video_file, stride=effective_stride, batch_size=batch_size)
@@ -354,7 +386,9 @@ def _process_single_video(
     records: list[dict[str, Any]] = []
     n_det = 0
     tot_kfs = 0
-    for batch_meta, batch_frames, fps, w, h in batch_gen:
+    last_log_time = t0
+
+    for batch_meta, batch_frames, b_fps, b_w, b_h in batch_gen:
         tot_kfs += len(batch_frames)
         results = model.predict(batch_frames, conf=conf, device=gpu_id, verbose=False, max_det=max_det, agnostic_nms=True)
         for meta, img, det in zip(batch_meta, batch_frames, results):
@@ -371,7 +405,7 @@ def _process_single_video(
                 "video_id": vid, "time": float(meta["middle_time"]), "frame_idx": int(meta["middle_frame"]),
                 "start_time": float(meta["start_time"]), "end_time": float(meta["end_time"]),
                 "start_frame": int(meta["start_frame"]), "end_frame": int(meta["end_frame"]),
-                "fps": float(round(fps, 2)), "width": int(w), "height": int(h),
+                "fps": float(round(b_fps, 2)), "width": int(b_w), "height": int(b_h),
                 "objects": sorted(list(set(b_lbls))), "scores": b_scs, "boxes": b_boxes, "labels": b_lbls,
                 "txt": encode_positional_boxes(b_boxes, b_lbls), "objects_str": encode_object_counts(b_lbls, b_scs),
                 "colors": colors, "is_monochrome": mono, "video_path": str(video_file),
@@ -381,11 +415,19 @@ def _process_single_video(
                 res_q.put(records)
                 records = []
 
+        now = time.perf_counter()
+        if now - last_log_time >= 5.0:
+            elapsed = now - t0
+            cur_fps = tot_kfs / max(1e-4, elapsed)
+            print(f">  [{gpu_id}] [{video_file.name}] {tot_kfs} kf ({cur_fps:.1f} fps) | {n_det} objs | elapsed: {int(elapsed)}s", flush=True)
+            last_log_time = now
+
     # Flush remaining
     if records:
         res_q.put(records)
 
     el = max(1e-4, time.perf_counter() - t0)
+    print(f">  [{gpu_id}] [{video_file.name}] Finished: {tot_kfs} kf, {n_det} objs in {el:.1f}s ({tot_kfs / el:.1f} fps)", flush=True)
     return tot_kfs, n_det, el
 
 
@@ -432,6 +474,7 @@ def gpu_worker_process(
 
             if t.is_alive():
                 # Timeout — report and move on (thread is daemon, will die with process)
+                print(f">  [{gpu_id}] [{video_file.name}] TIMED OUT after {timeout}s!", flush=True)
                 prog_q.put({
                     "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
                     "file_size": fsize, "num_keyframes": 0, "num_detections": 0,
@@ -439,6 +482,7 @@ def gpu_worker_process(
                     "error_msg": f"Timed out after {timeout}s",
                 })
             elif isinstance(result_holder[0], Exception):
+                print(f">  [{gpu_id}] [{video_file.name}] ERROR: {result_holder[0]}", flush=True)
                 prog_q.put({
                     "worker_id": worker_id, "gpu_id": gpu_id, "video_name": video_file.name,
                     "file_size": fsize, "num_keyframes": 0, "num_detections": 0,
